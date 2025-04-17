@@ -1,0 +1,106 @@
+# Configuration de l'exchange principal à utiliser
+# Options: BINANCE, MEXC, KUCOIN, KRAKEN
+# Actuellement, BINANCE, MEXC, KUCOIN, KRAKEN Entièrement supportés
+# Exchange par défaut :
+EXCHANGE=BINANCE
+
+# =========== PARAMÈTRES SPÉCIFIQUES PAR EXCHANGE ===========
+# FORMAT: EXCHANGE_NAME_[PARAM]
+
+# ----- Binance -----
+# Offset d'achat: décalage en $ par rapport au prix actuel du BTC (valeur négative)
+BINANCE_BUY_OFFSET=-500
+
+# Offset de vente: décalage en $ par rapport au prix d'achat (valeur positive)
+BINANCE_SELL_OFFSET=500
+
+# Pourcentage du capital disponible à utiliser pour chaque cycle (1-100)
+BINANCE_PERCENT=4
+
+# Conditions d'annulation automatique des ordres d'achat (reliées par un OU logique):
+# - Si l'ordre n'est pas exécuté après X jours (0 = désactivé)
+BINANCE_BUY_MAX_DAYS=0
+
+# - Si le prix actuel dépasse de X% le prix d'achat (0 = désactivé)
+# Exemple: Pour 10%, le bot annulera l'ordre si le prix monte de 10% par rapport au prix d'achat
+BINANCE_BUY_MAX_PRICE_DEVIATION=0
+
+# Paramètres d'accumulation:
+# - Activer l'accumulation (true = activé, false = désactivé)
+BINANCE_ACCUMULATION=false
+# - Pourcentage de déviation pour l'accumulation (déviation minimale entre le prix de vente et le prix actuel)
+# Exemple: Pour 10%, le bot annulera l'ordre de vente pour accumuler si le prix actuel baisse de 10% par rapport au prix de vente configuré
+BINANCE_SELL_ACCU_PRICE_DEVIATION=10
+
+# Paramètres pour le calcul adaptatif des ordres d'achat:
+# - Activer le calcul adaptatif (true = activé, false = désactivé)
+BINANCE_ADAPTIVE_ORDER=false
+# - Ratio minimal de capital verrouillé/capital total pour activer la formule adaptative
+# Exemple: Pour 0,1 : 10% / 0,2 : 20%, le bot n'appliquera la formule que si le capital verrouillé 
+# représente au moins 10% du capital total. La formule permet de diminuer le capital utilisé dans le cas où le capital libre d'USDT > 50%  
+# et inférieur à (100% - MIN_LOCKED_RATIO). Ainsi si le BTC monte vite, vous éviter d'acheter trop fort trop haut.
+BINANCE_MIN_LOCKED_RATIO=0.1
+
+# ----- Mexc -----
+MEXC_BUY_OFFSET=-250
+MEXC_SELL_OFFSET=250
+MEXC_PERCENT=4
+MEXC_BUY_MAX_DAYS=2
+MEXC_BUY_MAX_PRICE_DEVIATION=40
+MEXC_ACCUMULATION=true
+MEXC_SELL_ACCU_PRICE_DEVIATION=40
+MEXC_ADAPTIVE_ORDER=false
+MEXC_MIN_LOCKED_RATIO=0.1
+
+# ----- Kucoin -----
+KUCOIN_BUY_OFFSET=-250
+KUCOIN_SELL_OFFSET=250
+KUCOIN_PERCENT=7
+KUCOIN_BUY_MAX_DAYS=2
+KUCOIN_BUY_MAX_PRICE_DEVIATION=40
+KUCOIN_ACCUMULATION=true
+KUCOIN_SELL_ACCU_PRICE_DEVIATION=40
+KUCOIN_ADAPTIVE_ORDER=false
+KUCOIN_MIN_LOCKED_RATIO=0.1
+
+# ----- Kraken -----
+KRAKEN_BUY_OFFSET=-300
+KRAKEN_SELL_OFFSET=300
+KRAKEN_PERCENT=5
+KRAKEN_BUY_MAX_DAYS=2
+KRAKEN_BUY_MAX_PRICE_DEVIATION=40
+KRAKEN_ACCUMULATION=true
+KRAKEN_SELL_ACCU_PRICE_DEVIATION=30
+KRAKEN_ADAPTIVE_ORDER=false
+KRAKEN_MIN_LOCKED_RATIO=0.1
+
+
+# =========== VALEURS PAR DÉFAUT GLOBALES ===========
+# Ces valeurs sont utilisées si les paramètres spécifiques à un exchange ne sont pas définis
+DEFAULT_PERCENT=4
+DEFAULT_BUY_MAX_DAYS=0
+DEFAULT_BUY_MAX_PRICE_DEVIATION=0
+DEFAULT_ACCUMULATION=false
+DEFAULT_SELL_ACCU_PRICE_DEVIATION=10
+
+# =========== CLÉS API PAR EXCHANGE ===========
+# Ces clés sont OBLIGATOIRES pour l'exchange que vous utilisez
+BINANCE_API_KEY=
+BINANCE_SECRET_KEY=
+
+MEXC_API_KEY=
+MEXC_SECRET_KEY=
+
+# Secret Key doit contenir la passphrase selon ce format : SECRET_KEY:PassPhrase
+KUCOIN_API_KEY=
+KUCOIN_SECRET_KEY=
+
+KRAKEN_API_KEY=
+KRAKEN_SECRET_KEY=
+
+# =========== CONFIGURATION SUPPLÉMENTAIRE ===========
+# Environment: production ou development
+ENVIRONMENT=production
+
+# Niveau de log: debug, info, warn, error
+LOG_LEVEL=info
