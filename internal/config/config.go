@@ -411,6 +411,7 @@ BINANCE_BUY_MAX_PRICE_DEVIATION=0
 BINANCE_ACCUMULATION=false
 # - Pourcentage de déviation pour l'accumulation (déviation minimale entre le prix de vente et le prix actuel)
 # Exemple: Pour 10%, le bot annulera l'ordre de vente pour accumuler si le prix actuel baisse de 10% par rapport au prix de vente configuré
+# Et uniquement si vous avez déjà réalisé au moins le bénéfice de la taille de l’ordre de vente à annuler grâce aux cycles précédents.
 BINANCE_SELL_ACCU_PRICE_DEVIATION=10
 
 # Paramètres pour le calcul adaptatif des ordres d'achat:
