@@ -1263,6 +1263,36 @@ func displayAccumulationInfo(exchange string) {
 
 // safeOrderCancel tente d'annuler un ordre et gère correctement les erreurs qui indiquent un succès
 func safeOrderCancel(client common.Exchange, orderId string, cycleId int32) (bool, error) {
+	// Vérifier si c'est un ID MEXC et appliquer un traitement spécial si nécessaire
+	if strings.Contains(orderId, "C02__") || strings.HasPrefix(orderId, "C02__") {
+		// Pour MEXC, tenter d'abord avec l'ID tel quel
+		_, err := client.CancelOrder(orderId)
+		if err == nil {
+			return true, nil
+		}
+
+		// Si ça échoue, essayer sans le préfixe
+		cleanId := strings.TrimPrefix(orderId, "C02__")
+		if cleanId != orderId {
+			_, err = client.CancelOrder(cleanId)
+			if err == nil {
+				return true, nil
+			}
+		}
+
+		// Si ça échoue encore, essayer avec le préfixe si l'ID n'en avait pas
+		if !strings.HasPrefix(orderId, "C02__") {
+			prefixedId := "C02__" + orderId
+			_, err = client.CancelOrder(prefixedId)
+			if err == nil {
+				return true, nil
+			}
+		}
+
+		// Si toutes les tentatives ont échoué, retourner l'erreur
+		return false, fmt.Errorf("impossible d'annuler l'ordre MEXC (toutes les méthodes tentées): %v", err)
+	}
+
 	// Tentative d'annulation de l'ordre
 	_, err := client.CancelOrder(orderId)
 
