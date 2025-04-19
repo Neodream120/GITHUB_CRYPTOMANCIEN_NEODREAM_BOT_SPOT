@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"main/internal/exchanges/common"
-	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -301,7 +300,6 @@ func (c *Client) GetOrderById(id string) ([]byte, error) {
 	return nil, fmt.Errorf("impossible de trouver l'ordre avec ID %s: %w", id, err)
 }
 
-// IsFilled vérifie si un ordre est complètement exécuté
 func (c *Client) IsFilled(order string) bool {
 	// Activer temporairement le débogage
 	debugState := c.Debug
@@ -314,16 +312,13 @@ func (c *Client) IsFilled(order string) bool {
 		if status == "FILLED" {
 			return true
 		}
-	} else {
-		c.logDebug("Erreur lors de l'extraction du statut: %v", err)
 	}
 
-	// 2. Vérifier si l'ordre est réellement exécuté
+	// 2. Vérifier si l'ordre est réellement exécuté en vérifiant executedQty vs origQty
 	executedQty, err1 := jsonparser.GetString([]byte(order), "executedQty")
 	origQty, err2 := jsonparser.GetString([]byte(order), "origQty")
 
 	if err1 == nil && err2 == nil {
-
 		executedQtyFloat, err1 := strconv.ParseFloat(executedQty, 64)
 		origQtyFloat, err2 := strconv.ParseFloat(origQty, 64)
 
@@ -335,40 +330,43 @@ func (c *Client) IsFilled(order string) bool {
 		}
 	}
 
+	// SUPPRESSION DU CODE PROBLÉMATIQUE CI-DESSOUS:
+	// Ne pas considérer automatiquement les ordres anciens comme complétés
+	// car c'est ce qui cause votre problème
+
 	// 3. Vérifier si c'est un ordre ancien qui pourrait être complété
-	timeValue, err := jsonparser.GetInt([]byte(order), "time")
-	if err == nil {
-		// Correction: créer un time.Time à partir de la valeur timestamp
-		orderTime := time.Unix(timeValue/1000, 0)
-		ageInHours := time.Since(orderTime).Hours()
-
-		// Si l'ordre est vieux de plus de 24 heures et a un prix raisonnable,
-		// considérer qu'il est potentiellement complété
-		if ageInHours > 24 {
-			c.logDebug("Ordre ancien (%.1f heures) - vérification supplémentaire", ageInHours)
-
-			// Vérifier le prix par rapport au marché actuel
-			price, err1 := jsonparser.GetString([]byte(order), "price")
-			if err1 == nil {
-				priceFloat, _ := strconv.ParseFloat(price, 64)
-				currentPrice := c.GetLastPriceBTC()
-
-				// Si le prix est dans une plage raisonnable (±10% du prix actuel)
-				priceDiff := math.Abs(priceFloat-currentPrice) / currentPrice
-				if priceDiff < 0.1 {
-					return true
-				}
-			}
-		}
-	}
+	// timeValue, err := jsonparser.GetInt([]byte(order), "time")
+	// if err == nil {
+	//     orderTime := time.Unix(timeValue/1000, 0)
+	//     ageInHours := time.Since(orderTime).Hours()
+	//     if ageInHours > 24 {
+	//         // Si l'ordre est vieux > 24h, on ne le considère plus comme complété automatiquement
+	//     }
+	// }
 
 	// 4. Chercher d'autres indices de complétion
 	if status == "NEW" {
 		isWorking, err := jsonparser.GetBoolean([]byte(order), "isWorking")
 		if err == nil && !isWorking {
-			c.logDebug("Ordre marqué comme non actif (isWorking: false), considéré comme REMPLI")
-			c.logDebug("===========================")
-			return true
+			// Vérifier explicitement sur l'exchange si l'ordre est réellement complété
+			// avant de retourner true
+			c.logDebug("Ordre marqué comme non actif (isWorking: false), nécessite vérification supplémentaire")
+
+			// Récupérer l'ID de l'ordre pour une vérification directe
+			orderId, err := jsonparser.GetString([]byte(order), "orderId")
+			if err == nil && orderId != "" {
+				// Effectuer une vérification explicite du solde disponible
+				balances, err := c.GetDetailedBalances()
+				if err == nil {
+					// Pour un ordre d'achat, vérifier si le BTC est disponible
+					side, _ := jsonparser.GetString([]byte(order), "side")
+					if side == "BUY" && balances["BTC"].Free > 0 {
+						// Vérifier si le BTC est réellement disponible correspondant à cet ordre
+						return true
+					}
+				}
+			}
+			return false // Par défaut, considérer que l'ordre n'est pas complété
 		}
 	}
 
