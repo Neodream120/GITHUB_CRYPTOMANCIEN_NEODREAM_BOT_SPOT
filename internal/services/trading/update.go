@@ -387,11 +387,37 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 			success, err := safeOrderCancel(client, cleanBuyId, cycle.IdInt)
 
 			if !success {
-				color.Red("Erreur lors de l'annulation de l'ordre par âge: %v", err)
-				return
+				// Si l'annulation échoue, essayer une méthode plus agressive pour MEXC
+				if cycle.Exchange == "MEXC" {
+					// Essayer différentes variantes de l'ID d'ordre
+					if strings.HasPrefix(cleanBuyId, "C02__") {
+						cleanId := strings.TrimPrefix(cleanBuyId, "C02__")
+						success, _ = safeOrderCancel(client, cleanId, cycle.IdInt)
+					} else {
+						prefixedId := "C02__" + cleanBuyId
+						success, _ = safeOrderCancel(client, prefixedId, cycle.IdInt)
+					}
+
+					// Dernière tentative avec l'extraction des chiffres uniquement
+					if !success {
+						re := regexp.MustCompile("[0-9]+")
+						matches := re.FindAllString(cleanBuyId, -1)
+						if len(matches) > 0 {
+							numericId := matches[0]
+							success, _ = safeOrderCancel(client, numericId, cycle.IdInt)
+						}
+					}
+				}
+
+				// Si toutes les tentatives échouent, informer l'utilisateur mais poursuivre
+				if !success {
+					color.Red("Erreur lors de l'annulation de l'ordre par âge: %v", err)
+					color.Yellow("L'ordre n'a pas pu être annulé sur l'exchange, mais le cycle sera supprimé de la base de données.")
+					color.Yellow("Vous devrez peut-être annuler manuellement l'ordre sur %s", cycle.Exchange)
+				}
 			}
 
-			// Mettre à jour le statut du cycle
+			// Mettre à jour le statut du cycle, MÊME SI l'annulation sur l'exchange a échoué
 			err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
 				"status": "cancelled",
 			})
@@ -467,37 +493,35 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 	color.Green("Cycle %d: Ordre d'achat exécuté", cycle.IdInt)
 
 	// ==== VÉRIFICATION DES SOLDES ====
-	// Vérifier si les fonds sont réellement disponibles avant de créer l'ordre de vente
 	balances, balErr := client.GetDetailedBalances()
 	if balErr != nil {
 		color.Red("Erreur lors de la récupération des soldes: %v", balErr)
-		// On met quand même à jour le statut du cycle pour ne pas perdre l'information
-		err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-			"status": "sell",
-			// Pas de SellId car l'ordre n'a pas été créé
-		})
-		color.Yellow("Cycle %d: Statut mis à jour à 'sell' mais l'ordre de vente n'a pas pu être créé. Veuillez vérifier manuellement.", cycle.IdInt)
 		return
 	}
 
-	// Vérifier si le solde BTC libre est suffisant
+	// Vérifier que le BTC est réellement disponible
 	availableBTC := balances["BTC"].Free
-	if availableBTC < cycle.Quantity*0.99 { // 99% de la quantité pour gérer les imprécisions
-		color.Yellow("Cycle %d: Solde BTC disponible insuffisant (%.8f) pour vendre %.8f BTC. Ordre d'achat marqué comme exécuté mais les fonds ne sont pas encore disponibles.",
+	if availableBTC < cycle.Quantity*0.99 {
+		color.Yellow("Cycle %d: Solde BTC disponible insuffisant (%.8f) pour vendre %.8f BTC. L'ordre semble ne pas être réellement exécuté.",
 			cycle.IdInt, availableBTC, cycle.Quantity)
 
-		// Mettre à jour uniquement le statut sans créer d'ordre de vente
-		err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-			"status": "sell",
-			// Pas de SellId car l'ordre n'a pas été créé
-		})
-		if err != nil {
-			color.Red("Erreur lors de la mise à jour du cycle: %v", err)
+		// L'ordre n'est probablement pas exécuté, malgré ce que dit IsFilled
+		// Vérifier l'âge et annuler si nécessaire
+		age := cycle.GetAge()
+		if maxDays > 0 && age >= float64(maxDays) {
+			color.Yellow("Cycle %d: L'ordre d'achat a dépassé l'âge maximal. Annulation forcée...", cycle.IdInt)
+			success, _ := safeOrderCancel(client, cleanBuyId, cycle.IdInt)
+			if success {
+				err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
+					"status": "cancelled",
+				})
+				if err == nil {
+					color.Green("Cycle %d: Ordre annulé et cycle marqué comme annulé", cycle.IdInt)
+				}
+			}
 		}
-		color.Yellow("Réessayez plus tard ou vérifiez l'état des fonds sur la plateforme %s", cycle.Exchange)
 		return
 	}
-
 	// Utiliser l'offset de vente spécifique à l'exchange
 	sellOffset := exchangeConfig.SellOffset
 
