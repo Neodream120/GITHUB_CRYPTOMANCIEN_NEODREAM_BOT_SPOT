@@ -453,9 +453,41 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 		return
 	}
 
-	// Vérifier si l'ordre est exécuté
-	isFilled := client.IsFilled(string(orderBytes))
-	if !isFilled {
+	// Vérification spécifique pour MEXC qui peut signaler FILLED avant mise à jour réelle des soldes
+	if cycle.Exchange == "MEXC" && client.IsFilled(string(orderBytes)) {
+		// Récupérer les soldes pour confirmer que le BTC est disponible
+		balances, balErr := client.GetDetailedBalances()
+		if balErr == nil {
+			availableBTC := balances["BTC"].Free
+			color.Yellow("MEXC: Vérification solde BTC disponible: %.8f BTC pour cycle %.8f BTC",
+				availableBTC, cycle.Quantity)
+
+			// Si le solde disponible est insuffisant
+			if availableBTC < cycle.Quantity*0.95 {
+				color.Yellow("MEXC: Délai de 5 secondes pour permettre la mise à jour des soldes")
+				time.Sleep(5 * time.Second)
+
+				// Vérifier à nouveau après le délai
+				balances, balErr = client.GetDetailedBalances()
+				if balErr == nil {
+					availableBTC = balances["BTC"].Free
+					color.Yellow("MEXC: Après délai - Solde BTC disponible: %.8f BTC pour cycle %.8f BTC",
+						availableBTC, cycle.Quantity)
+
+					// Si toujours insuffisant
+					if availableBTC < cycle.Quantity*0.95 {
+						// Ne pas poursuivre la création de l'ordre de vente pour ce cycle
+						color.Yellow("Cycle %d: Solde BTC disponible insuffisant (%.8f) pour vendre %.8f BTC. L'ordre semble ne pas être réellement exécuté.",
+							cycle.IdInt, availableBTC, cycle.Quantity)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// Vérifier si l'ordre n'est PAS rempli
+	if !client.IsFilled(string(orderBytes)) {
 		// Vérifier si l'ordre devrait être annulé en raison de la déviation de prix
 		if maxPriceDeviation > 0 {
 			// Calculer le seuil d'annulation basé sur le pourcentage configuré
@@ -962,7 +994,6 @@ func displayCyclesHistory(cycles []*database.Cycle, _ float64) {
 	color.Cyan("===== CYCLES ACTIFS =====")
 	fmt.Println("")
 
-	// En-tête du tableau modifié: suppression de "QUANTITÉ BTC" et "DATE DÉBUT", ajout des colonnes demandées
 	headerFormat := "%-5s | %-10s | %-12s | %-15s | %-20s | %-15s | %-15s\n"
 	rowFormat := "%-5d | %-10s | %-12s | %-15.2f | %-20.2f | %-15s | %-15s\n"
 
@@ -977,8 +1008,8 @@ func displayCyclesHistory(cycles []*database.Cycle, _ float64) {
 	// Filtrer et afficher uniquement les cycles non complétés
 	activeCycles := 0
 	for _, cycle := range cycles {
-		// Exclure les cycles complétés
-		if cycle.Status == "completed" {
+		// Exclure les cycles complétés et annulés
+		if cycle.Status == "completed" || cycle.Status == "cancelled" {
 			// Mettre à jour les statistiques mais ne pas afficher
 			updateStats(cycle, &statsBinance, &statsMexc, &statsKucoin, &statsKraken)
 			continue

@@ -147,10 +147,11 @@ func displayExistingTasks(sched *scheduler.Scheduler) {
 			}
 		}
 
-		// Afficher la prochaine exécution
-		if !task.NextScheduledAt.IsZero() {
+		if !task.NextScheduledAt.IsZero() && task.NextScheduledAt.After(time.Now()) {
 			fmt.Printf("   Prochaine exécution: %s\n",
 				task.NextScheduledAt.Format("02/01/2006 15:04:05"))
+		} else {
+			fmt.Printf("   Prochaine exécution: [À calculer au démarrage]\n")
 		}
 	}
 }

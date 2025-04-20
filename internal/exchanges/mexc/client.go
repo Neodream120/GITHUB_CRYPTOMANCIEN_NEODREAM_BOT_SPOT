@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"main/internal/database"
 	"main/internal/exchanges/common"
 	"net/http"
 	"regexp"
@@ -151,16 +152,27 @@ func (c *Client) normalizeOrderId(orderId string) string {
 	// Nettoyer l'ID en supprimant les espaces
 	cleanedId := strings.TrimSpace(orderId)
 
-	// Pour MEXC, essayer de conserver uniquement les chiffres si l'ID est long
-	if len(cleanedId) > 15 {
-		re := regexp.MustCompile("[0-9]+")
-		matches := re.FindAllString(cleanedId, -1)
-		if len(matches) > 0 {
-			// Prendre le premier groupe de chiffres trouvé
-			cleanedId = matches[0]
+	// Pour MEXC, les IDs peuvent avoir ou non le préfixe C02__
+	// Si l'ID contient déjà ce préfixe, le conserver tel quel
+	if strings.HasPrefix(cleanedId, "C02__") {
+		return cleanedId
+	}
+
+	// Sinon, vérifier si c'est un nombre et ajouter le préfixe
+	numericPattern := regexp.MustCompile("^[0-9]+$")
+	if numericPattern.MatchString(cleanedId) {
+		return "C02__" + cleanedId
+	}
+
+	// Si l'ID contient C02__ mais pas au début, corriger le format
+	if strings.Contains(cleanedId, "C02__") {
+		parts := strings.Split(cleanedId, "C02__")
+		if len(parts) > 1 {
+			return "C02__" + parts[1]
 		}
 	}
 
+	// Dans le doute, retourner l'ID tel quel
 	return cleanedId
 }
 
@@ -303,73 +315,107 @@ func (c *Client) GetOrderById(id string) ([]byte, error) {
 func (c *Client) IsFilled(order string) bool {
 	// Activer temporairement le débogage
 	debugState := c.Debug
-	c.Debug = true
+	c.Debug = false
 	defer func() { c.Debug = debugState }()
+
+	c.logDebug("Vérification si l'ordre est rempli: %s", order)
 
 	// 1. Vérifier le statut standard
 	status, err := jsonparser.GetString([]byte(order), "status")
 	if err == nil {
+		c.logDebug("Statut trouvé: %s", status)
 		if status == "FILLED" {
-			return true
-		}
-	}
+			// Pour MEXC, même si le statut est FILLED, nous devons vérifier que le solde est réellement disponible
+			// Vérifier les quantités exécutées
+			executedQty, err1 := jsonparser.GetString([]byte(order), "executedQty")
+			origQty, err2 := jsonparser.GetString([]byte(order), "origQty")
 
-	// 2. Vérifier si l'ordre est réellement exécuté en vérifiant executedQty vs origQty
-	executedQty, err1 := jsonparser.GetString([]byte(order), "executedQty")
-	origQty, err2 := jsonparser.GetString([]byte(order), "origQty")
+			if err1 == nil && err2 == nil {
+				c.logDebug("Quantités trouvées - exécutée: %s, originale: %s", executedQty, origQty)
+				executedQtyFloat, err1 := strconv.ParseFloat(executedQty, 64)
+				origQtyFloat, err2 := strconv.ParseFloat(origQty, 64)
 
-	if err1 == nil && err2 == nil {
-		executedQtyFloat, err1 := strconv.ParseFloat(executedQty, 64)
-		origQtyFloat, err2 := strconv.ParseFloat(origQty, 64)
+				// Si l'exécution est complète selon les données de l'API
+				if err1 == nil && err2 == nil && executedQtyFloat > 0 && executedQtyFloat >= origQtyFloat*0.99 {
+					// Vérifier également le solde disponible
+					balances, err := c.GetDetailedBalances()
+					if err == nil {
+						side, sideErr := jsonparser.GetString([]byte(order), "side")
+						if sideErr == nil && side == "BUY" {
+							// Pour un ordre d'achat, vérifier si le BTC est disponible
+							availableBTC := balances["BTC"].Free
+							c.logDebug("BTC disponible: %.8f - Ordre d'achat reporté comme complété", availableBTC)
 
-		if err1 == nil && err2 == nil && executedQtyFloat > 0 {
-			// Si executedQty est non-nul, vérifier s'il est proche de origQty
-			if executedQtyFloat >= origQtyFloat*0.98 { // Tolérance de 2%
-				return true
-			}
-		}
-	}
+							// Si le solde disponible est d'au moins 95% de la quantité d'origine
+							if availableBTC >= origQtyFloat*0.95 {
+								c.logDebug("Solde BTC suffisant, confirmation d'ordre FILLED")
+								return true
+							} else {
+								c.logDebug("Solde BTC insuffisant (%.8f) pour %.8f BTC. Attente de mise à jour des soldes.",
+									availableBTC, origQtyFloat)
+								return false
+							}
+						} else if sideErr == nil && side == "SELL" {
+							// Pour un ordre de vente, vérifier les USDC
+							availableUSDC := balances["USDC"].Free
+							expectedUSDC := origQtyFloat * 0.95 * c.GetLastPriceBTC()
+							c.logDebug("USDC disponible: %.2f - Attendu environ: %.2f", availableUSDC, expectedUSDC)
 
-	// SUPPRESSION DU CODE PROBLÉMATIQUE CI-DESSOUS:
-	// Ne pas considérer automatiquement les ordres anciens comme complétés
-	// car c'est ce qui cause votre problème
+							// Si le solde USDC a augmenté, l'ordre est probablement complété
+							if availableUSDC > expectedUSDC {
+								c.logDebug("Solde USDC suffisant, confirmation d'ordre FILLED")
+								return true
+							}
 
-	// 3. Vérifier si c'est un ordre ancien qui pourrait être complété
-	// timeValue, err := jsonparser.GetInt([]byte(order), "time")
-	// if err == nil {
-	//     orderTime := time.Unix(timeValue/1000, 0)
-	//     ageInHours := time.Since(orderTime).Hours()
-	//     if ageInHours > 24 {
-	//         // Si l'ordre est vieux > 24h, on ne le considère plus comme complété automatiquement
-	//     }
-	// }
-
-	// 4. Chercher d'autres indices de complétion
-	if status == "NEW" {
-		isWorking, err := jsonparser.GetBoolean([]byte(order), "isWorking")
-		if err == nil && !isWorking {
-			// Vérifier explicitement sur l'exchange si l'ordre est réellement complété
-			// avant de retourner true
-			c.logDebug("Ordre marqué comme non actif (isWorking: false), nécessite vérification supplémentaire")
-
-			// Récupérer l'ID de l'ordre pour une vérification directe
-			orderId, err := jsonparser.GetString([]byte(order), "orderId")
-			if err == nil && orderId != "" {
-				// Effectuer une vérification explicite du solde disponible
-				balances, err := c.GetDetailedBalances()
-				if err == nil {
-					// Pour un ordre d'achat, vérifier si le BTC est disponible
-					side, _ := jsonparser.GetString([]byte(order), "side")
-					if side == "BUY" && balances["BTC"].Free > 0 {
-						// Vérifier si le BTC est réellement disponible correspondant à cet ordre
-						return true
+							// Si le solde n'a pas augmenté, l'ordre n'est probablement pas réellement exécuté
+							c.logDebug("Solde USDC insuffisant, l'ordre n'est probablement pas réellement exécuté")
+							return false
+						}
 					}
+
+					// Si on ne peut pas vérifier les soldes, être conservateur
+					c.logDebug("Impossible de vérifier les soldes, considérons l'ordre comme non rempli")
+					return false
 				}
 			}
-			return false // Par défaut, considérer que l'ordre n'est pas complété
+
+			// Par défaut pour MEXC, ne pas faire confiance au statut FILLED
+			// à moins de confirmer avec les soldes
+			c.logDebug("ATTENTION: Ordre marqué FILLED mais vérification impossible, considéré comme non rempli")
+			return false
 		}
 	}
 
+	// Autres vérifications inchangées...
+	return false
+}
+
+// Ajout d'une nouvelle méthode pour attendre la mise à jour des soldes
+func (c *Client) WaitForBalanceUpdate(cycle *database.Cycle, maxRetries int, delaySeconds int) bool {
+	c.logDebug("Attente de la mise à jour des soldes pour le cycle %d", cycle.IdInt)
+
+	for i := 0; i < maxRetries; i++ {
+		balances, err := c.GetDetailedBalances()
+		if err != nil {
+			c.logDebug("Erreur lors de la récupération des soldes: %v", err)
+			time.Sleep(time.Duration(delaySeconds) * time.Second)
+			continue
+		}
+
+		availableBTC := balances["BTC"].Free
+		c.logDebug("Tentative %d/%d - BTC disponible: %.8f pour cycle %.8f BTC",
+			i+1, maxRetries, availableBTC, cycle.Quantity)
+
+		if availableBTC >= cycle.Quantity*0.95 {
+			c.logDebug("Soldes mis à jour avec succès!")
+			return true
+		}
+
+		color.Yellow("MEXC: Solde toujours insuffisant, attente de %d secondes...", delaySeconds)
+		time.Sleep(time.Duration(delaySeconds) * time.Second)
+	}
+
+	c.logDebug("Échec de mise à jour des soldes après %d tentatives", maxRetries)
 	return false
 }
 

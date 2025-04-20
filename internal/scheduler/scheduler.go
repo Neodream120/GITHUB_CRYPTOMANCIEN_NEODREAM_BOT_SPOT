@@ -373,24 +373,12 @@ func (s *Scheduler) LoadTasksFromConfig() error {
 			Fn:     taskFn,
 		}
 
-		// Ne recalculer la prochaine exécution que si elle n'est pas déjà définie
-		if task.Config.NextScheduledAt.IsZero() {
+		if task.Config.NextScheduledAt.IsZero() || task.Config.NextScheduledAt.Before(time.Now()) {
 			task.Config.NextScheduledAt = s.calculateNextRun(taskConfig)
 		}
 
 		s.tasks = append(s.tasks, task)
 
-		// Log plus détaillé sur l'intervalle
-		intervalDesc := ""
-		if task.Config.IntervalValue > 0 {
-			intervalDesc = fmt.Sprintf("%d %s", task.Config.IntervalValue, task.Config.IntervalUnit)
-		} else {
-			value, unit := DurationToUserFriendly(task.Config.Interval)
-			intervalDesc = fmt.Sprintf("%d %s", value, unit)
-		}
-
-		s.logger.Info("Tâche chargée depuis la configuration: %s (intervalle: %s, prochaine exécution: %s)",
-			taskConfig.Name, intervalDesc, task.Config.NextScheduledAt.Format("2006-01-02 15:04:05"))
 	}
 
 	return nil
