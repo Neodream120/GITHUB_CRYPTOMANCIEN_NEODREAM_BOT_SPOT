@@ -5,6 +5,7 @@ import (
 	"main/internal/config"
 	"main/internal/database"
 	"main/internal/exchanges/common"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -351,7 +352,7 @@ func Update() {
 // processBuyCycle traite un cycle en statut "buy" pour n'importe quel exchange
 func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cycle *database.Cycle, lastPrice float64) {
 	// Nettoyer l'ID d'ordre d'achat
-	cleanBuyId := cycle.BuyId
+	cleanBuyId := cleanOrderId(cycle.BuyId, cycle.Exchange)
 
 	if cleanBuyId == "" {
 		color.Red("ID d'ordre d'achat invalide: %s", cycle.BuyId)
@@ -523,6 +524,82 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 
 	// L'ordre a été exécuté, passer à l'étape de vente
 	color.Green("Cycle %d: Ordre d'achat exécuté", cycle.IdInt)
+
+	// ====== DÉBUT NOUVELLE PARTIE - EXTRACTION DE LA QUANTITÉ RÉELLEMENT EXÉCUTÉE DEPUIS L'API ======
+	var executedQty float64 = 0
+
+	switch cycle.Exchange {
+	case "MEXC":
+		// Format de réponse pour MEXC
+		executedQtyStr, err := jsonparser.GetString(orderBytes, "executedQty")
+		if err == nil && executedQtyStr != "" {
+			parsedQty, parseErr := strconv.ParseFloat(executedQtyStr, 64)
+			if parseErr == nil && parsedQty > 0 {
+				executedQty = parsedQty
+				color.Yellow("MEXC: Quantité exécutée extraite de l'API: %.8f BTC", executedQty)
+			}
+		}
+
+	case "BINANCE":
+		// Format de réponse pour Binance
+		executedQtyStr, err := jsonparser.GetString(orderBytes, "executedQty")
+		if err == nil && executedQtyStr != "" {
+			parsedQty, parseErr := strconv.ParseFloat(executedQtyStr, 64)
+			if parseErr == nil && parsedQty > 0 {
+				executedQty = parsedQty
+				color.Yellow("BINANCE: Quantité exécutée extraite de l'API: %.8f BTC", executedQty)
+			}
+		}
+
+	case "KUCOIN":
+		// Format de réponse pour KuCoin
+		dealSizeStr, err := jsonparser.GetString(orderBytes, "dealSize")
+		if err == nil && dealSizeStr != "" {
+			parsedQty, parseErr := strconv.ParseFloat(dealSizeStr, 64)
+			if parseErr == nil && parsedQty > 0 {
+				executedQty = parsedQty
+				color.Yellow("KUCOIN: Quantité exécutée extraite de l'API: %.8f BTC", executedQty)
+			}
+		}
+
+	case "KRAKEN":
+		// Format de réponse pour Kraken
+		var volExecStr string
+
+		// Essayer différents chemins possibles dans la réponse JSON
+		volExecStr, _ = jsonparser.GetString(orderBytes, "vol_exec")
+		if volExecStr == "" {
+			volExecStr, _ = jsonparser.GetString(orderBytes, "executed")
+		}
+
+		if volExecStr != "" {
+			parsedQty, parseErr := strconv.ParseFloat(volExecStr, 64)
+			if parseErr == nil && parsedQty > 0 {
+				executedQty = parsedQty
+				color.Yellow("KRAKEN: Quantité exécutée extraite de l'API: %.8f BTC", executedQty)
+			}
+		}
+	}
+
+	// Si nous avons pu extraire une quantité valide de l'API ET si elle est différente de la quantité initiale
+	if executedQty > 0 && math.Abs(executedQty-cycle.Quantity)/cycle.Quantity > 0.001 { // Différence de plus de 0.1%
+		color.Yellow("Cycle %d: Mise à jour de la quantité de %.8f BTC à %.8f BTC (d'après l'API)",
+			cycle.IdInt, cycle.Quantity, executedQty)
+
+		// Mettre à jour la quantité dans la base de données
+		err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
+			"quantity": executedQty,
+		})
+
+		if err != nil {
+			color.Red("Erreur lors de la mise à jour de la quantité: %v", err)
+			// Continuer avec la quantité originale
+		} else {
+			// Mettre à jour l'objet cycle local pour la suite du traitement
+			cycle.Quantity = executedQty
+		}
+	}
+	// ====== FIN NOUVELLE PARTIE ======
 
 	// ==== VÉRIFICATION DES SOLDES ====
 	balances, balErr := client.GetDetailedBalances()
