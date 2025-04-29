@@ -214,6 +214,11 @@ func (r *CycleRepository) Save(cycle *Cycle) (string, error) {
 	doc.Set("sellId", cycle.SellId)
 	doc.Set("createdAt", cycle.CreatedAt.Format(time.RFC3339))
 
+	// Champs de frais
+	//doc.Set("buyFees", cycle.BuyFees)
+	//doc.Set("sellFees", cycle.SellFees)
+	doc.Set("totalFees", cycle.TotalFees)
+
 	// Ajouter la date de complétion si elle existe
 	if !cycle.CompletedAt.IsZero() {
 		doc.Set("completedAt", cycle.CompletedAt.Format(time.RFC3339))

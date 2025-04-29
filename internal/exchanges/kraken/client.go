@@ -661,20 +661,73 @@ func (c *Client) GetAccountInfo() ([]byte, error) {
 
 // CreateMakerOrder crée un ordre en mode maker
 func (c *Client) CreateMakerOrder(side string, price float64, quantity string) ([]byte, error) {
-	// Ajuster le prix pour s'assurer d'être maker
+	// Convertir la quantité en float pour les calculs
+	quantityFloat, err := strconv.ParseFloat(quantity, 64)
+	if err != nil {
+		return nil, fmt.Errorf("erreur lors de la conversion de la quantité: %w", err)
+	}
+
 	var adjustedPrice float64
 	if strings.ToUpper(side) == "BUY" {
 		// Pour un achat, placer l'ordre légèrement en dessous du marché
 		adjustedPrice = price * 0.998 // 0.2% en dessous
 	} else {
-		// Pour une vente, placer l'ordre légèrement au-dessus du marché
-		adjustedPrice = price * 1.002 // 0.2% au-dessus
+		// Pour une vente, nous devons prendre en compte les frais
+
+		// Taux de frais maker de Kraken (0.26% pour les niveaux de base)
+		const makerFeeRate = 0.0026
+
+		// Estimer les frais d'achat déjà payés
+		buyFees := price * quantityFloat * makerFeeRate
+
+		// Estimer les frais de vente à venir
+		sellFees := price * quantityFloat * makerFeeRate
+
+		// Total des frais à couvrir
+		totalFeesToCover := buyFees + sellFees
+
+		// Ajouter une marge de sécurité de 10%
+		totalFeesToCover *= 1.1
+
+		// Calculer l'ajustement de prix nécessaire par unité
+		feeAdjustmentPerUnit := totalFeesToCover / quantityFloat
+
+		// Prix minimum pour couvrir les frais
+		minProfitablePrice := price + feeAdjustmentPerUnit
+
+		// Prix maker standard (0.2% au-dessus)
+		standardPrice := price * 1.002
+
+		// Obtenir le prix actuel du marché
+		currentPrice := c.GetLastPriceBTC()
+
+		// Prix maker basé sur le prix actuel du marché
+		marketBasedPrice := currentPrice * 1.001 // 0.1% au-dessus du prix actuel
+
+		// Logique pour choisir le prix final:
+		// 1. Le prix doit au moins couvrir les frais (minProfitablePrice)
+		// 2. Il doit être suffisant pour être un ordre maker (marketBasedPrice)
+		// 3. Il doit respecter l'offset standard s'il est plus élevé (standardPrice)
+
+		// Prendre le maximum des trois prix
+		adjustedPrice = math.Max(minProfitablePrice, math.Max(marketBasedPrice, standardPrice))
+
+		c.logDebug("Calcul du prix de vente Kraken:")
+		c.logDebug("Prix d'achat: %.2f USDC", price)
+		c.logDebug("Prix actuel du marché: %.2f USDC", currentPrice)
+		c.logDebug("Frais d'achat estimés: %.8f USDC", buyFees)
+		c.logDebug("Frais de vente estimés: %.8f USDC", sellFees)
+		c.logDebug("Ajustement pour frais: %.8f USDC", feeAdjustmentPerUnit)
+		c.logDebug("Prix minimum rentable: %.2f USDC", minProfitablePrice)
+		c.logDebug("Prix maker standard: %.2f USDC", standardPrice)
+		c.logDebug("Prix basé sur le marché: %.2f USDC", marketBasedPrice)
+		c.logDebug("Prix final ajusté: %.2f USDC", adjustedPrice)
 	}
 
 	// Formater le prix avec précision
 	adjustedPriceStr := c.formatPrice(adjustedPrice)
 
-	// Créer l'ordre avec le flag post-only pour être sûr d'être maker
+	// Créer l'ordre avec le prix ajusté
 	return c.CreateOrder(side, adjustedPriceStr, quantity)
 }
 
@@ -683,4 +736,166 @@ func (c *Client) formatPrice(price float64) string {
 	// Kraken utilise généralement une précision de 1 décimale pour les prix BTC/USDC
 	// mais cela peut varier, donc nous utilisons 2 décimales pour être sûrs
 	return strconv.FormatFloat(math.Floor(price*100)/100, 'f', 2, 64)
+}
+
+// GetOrderFees récupère les frais appliqués à un ordre spécifique
+func (c *Client) GetOrderFees(orderId string) (float64, error) {
+	// Créer les paramètres pour la requête
+	params := url.Values{}
+	params.Set("txid", orderId)
+	params.Set("trades", "true") // Inclure les trades associés pour obtenir les frais
+
+	// Envoyer la requête pour obtenir les détails de l'ordre
+	data, err := c.sendPrivateRequest("QueryOrders", params)
+	if err != nil {
+		return 0, fmt.Errorf("erreur lors de la récupération des détails de l'ordre: %w", err)
+	}
+
+	// Extraire les frais de la réponse
+	// La réponse de Kraken contient les ordres sous forme de map avec l'ID comme clé
+	var orderFees float64
+
+	err = json.Unmarshal(data, &map[string]json.RawMessage{})
+	if err != nil {
+		return 0, fmt.Errorf("erreur lors du parsing des données d'ordre: %w", err)
+	}
+
+	// Comme la réponse est une map, nous devons itérer
+	for _, orderDetails := range map[string]json.RawMessage{} {
+		// Extraire les frais
+		var order struct {
+			Fee string `json:"fee"`
+		}
+
+		if err := json.Unmarshal(orderDetails, &order); err == nil && order.Fee != "" {
+			orderFees, _ = strconv.ParseFloat(order.Fee, 64)
+			if orderFees > 0 {
+				return orderFees, nil
+			}
+		}
+	}
+
+	// Si les frais n'ont pas été trouvés dans les détails de l'ordre,
+	// essayer d'obtenir l'historique des trades
+	params = url.Values{}
+	params.Set("txid", orderId)
+
+	tradesData, err := c.sendPrivateRequest("TradesHistory", params)
+	if err != nil {
+		// Si nous ne pouvons pas obtenir les trades, estimer les frais
+		return c.estimateOrderFees(orderId)
+	}
+
+	// Analyser les trades pour obtenir les frais
+	var trades struct {
+		Trades map[string]struct {
+			Fee       string `json:"fee"`
+			OrderTxid string `json:"ordertxid"`
+		} `json:"trades"`
+	}
+
+	if err := json.Unmarshal(tradesData, &trades); err == nil {
+		var totalFees float64
+
+		for _, trade := range trades.Trades {
+			if trade.OrderTxid == orderId {
+				if fee, err := strconv.ParseFloat(trade.Fee, 64); err == nil {
+					totalFees += fee
+				}
+			}
+		}
+
+		if totalFees > 0 {
+			return totalFees, nil
+		}
+	}
+
+	// En dernier recours, estimer les frais
+	return c.estimateOrderFees(orderId)
+}
+
+// estimateOrderFees estime les frais d'un ordre à partir de son ID
+func (c *Client) estimateOrderFees(orderId string) (float64, error) {
+	// Pour Kraken, le taux de frais maker standard est 0.26%
+	const makerFeeRate = 0.0026
+
+	// Récupérer les détails de l'ordre
+	params := url.Values{}
+	params.Set("txid", orderId)
+
+	orderData, err := c.sendPrivateRequest("QueryOrders", params)
+	if err != nil {
+		return 0, fmt.Errorf("erreur lors de la récupération des détails de l'ordre: %w", err)
+	}
+
+	// Analyser les détails pour estimer les frais
+	var orders map[string]struct {
+		Price     string `json:"price"`
+		Volume    string `json:"vol"`
+		VolumeExe string `json:"vol_exec"`
+	}
+
+	if err := json.Unmarshal(orderData, &orders); err != nil {
+		return 0, fmt.Errorf("erreur lors du parsing des détails de l'ordre: %w", err)
+	}
+
+	// Pour chaque ordre (normalement un seul)
+	for _, order := range orders {
+		price, err1 := strconv.ParseFloat(order.Price, 64)
+		volume, err2 := strconv.ParseFloat(order.VolumeExe, 64)
+
+		if err1 == nil && err2 == nil && price > 0 && volume > 0 {
+			// Calculer les frais estimés
+			return price * volume * makerFeeRate, nil
+		}
+	}
+
+	return 0, fmt.Errorf("impossible d'estimer les frais d'ordre")
+}
+
+// AdjustSellPriceForFees ajuste le prix de vente pour prendre en compte les frais de Kraken
+func (c *Client) AdjustSellPriceForFees(buyPrice float64, quantity float64, buyOrderId string) (float64, error) {
+	// Récupérer les frais réels de l'ordre d'achat si possible
+	buyFees, err := c.GetOrderFees(buyOrderId)
+
+	// Si on ne peut pas récupérer les frais, estimer avec le taux standard
+	if err != nil || buyFees <= 0 {
+		// Taux de frais maker de Kraken (0.26%)
+		const makerFeeRate = 0.0026
+		buyFees = buyPrice * quantity * makerFeeRate
+	}
+
+	// Multiplier par 2 pour couvrir les frais de vente également
+	totalFeesToCover := buyFees * 2
+
+	// Ajouter une marge de sécurité de 10% pour Kraken qui a des frais plus élevés
+	totalFeesToCover *= 1.1
+
+	// Calculer l'ajustement de prix par unité
+	feeAdjustmentPerUnit := totalFeesToCover / quantity
+
+	// Calculer le prix minimum pour être rentable
+	minProfitablePrice := buyPrice + feeAdjustmentPerUnit
+
+	c.logDebug("Calcul du prix de vente pour couvrir les frais Kraken:")
+	c.logDebug("Prix d'achat: %.2f USDC", buyPrice)
+	c.logDebug("Frais d'achat: %.8f USDC", buyFees)
+	c.logDebug("Frais totaux à couvrir: %.8f USDC", totalFeesToCover)
+	c.logDebug("Ajustement par unité: %.8f USDC", feeAdjustmentPerUnit)
+	c.logDebug("Prix minimal rentable: %.2f USDC", minProfitablePrice)
+
+	return minProfitablePrice, nil
+}
+
+func (c *Client) GetOpenOrders() ([]byte, error) {
+	// Créer la requête
+	params := url.Values{}
+
+	// Envoyer la requête
+	data, err := c.sendPrivateRequest("OpenOrders", params)
+	if err != nil {
+		return nil, fmt.Errorf("erreur lors de la récupération des ordres ouverts: %w", err)
+	}
+
+	return data, nil
 }

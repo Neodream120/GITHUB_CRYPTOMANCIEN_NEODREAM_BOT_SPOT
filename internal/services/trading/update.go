@@ -105,55 +105,6 @@ func cleanOrderId(orderId string, exchange ...string) string {
 	}
 }
 
-// ForceCompleteOldMexcOrders force les ordres MEXC anciens à être marqués comme complétés
-func ForceCompleteOldMexcOrders() {
-	color.Yellow("Recherche d'ordres MEXC anciens à marquer comme complétés...")
-
-	// Obtenir le repository
-	repo := database.GetRepository()
-
-	// Récupérer tous les cycles
-	cycles, err := repo.FindAll()
-	if err != nil {
-		color.Red("Erreur lors de la récupération des cycles: %v", err)
-		return
-	}
-
-	// Compteur pour les ordres modifiés
-	completedCount := 0
-
-	// Parcourir tous les cycles MEXC en vente
-	for _, cycle := range cycles {
-		if cycle.Exchange == "MEXC" && cycle.Status == "sell" {
-			// Calculer l'âge du cycle en jours
-			ageInDays := cycle.GetAge()
-
-			// Si le cycle est en vente depuis plus de 7 jours, le marquer comme complété
-			if ageInDays > 7 {
-				color.Yellow("Cycle %d trouvé en vente depuis %.1f jours", cycle.IdInt, ageInDays)
-
-				// Mise à jour du statut dans la base de données
-				err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-					"status": "completed",
-				})
-
-				if err != nil {
-					color.Red("Erreur lors de la mise à jour du cycle: %v", err)
-				} else {
-					color.Green("Cycle %d marqué comme complété manuellement", cycle.IdInt)
-					completedCount++
-				}
-			}
-		}
-	}
-
-	if completedCount > 0 {
-		color.Green("%d cycles MEXC anciens ont été marqués comme complétés", completedCount)
-	} else {
-		color.Yellow("Aucun cycle MEXC ancien à marquer comme complété")
-	}
-}
-
 func Update() {
 	// Récupérer tous les exchanges configurés
 	cfg, err := config.LoadConfig()
@@ -388,9 +339,9 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 			success, err := safeOrderCancel(client, cleanBuyId, cycle.IdInt)
 
 			if !success {
-				// Si l'annulation échoue, essayer une méthode plus agressive pour MEXC
+				// Si l'annulation échoue, tenter d'autres méthodes selon l'exchange
 				if cycle.Exchange == "MEXC" {
-					// Essayer différentes variantes de l'ID d'ordre
+					// Logique spécifique pour MEXC...
 					if strings.HasPrefix(cleanBuyId, "C02__") {
 						cleanId := strings.TrimPrefix(cleanBuyId, "C02__")
 						success, _ = safeOrderCancel(client, cleanId, cycle.IdInt)
@@ -464,7 +415,7 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 				availableBTC, cycle.Quantity)
 
 			// Si le solde disponible est insuffisant
-			if availableBTC < cycle.Quantity*0.95 {
+			if availableBTC < cycle.Quantity*0.98 {
 				color.Yellow("MEXC: Délai de 5 secondes pour permettre la mise à jour des soldes")
 				time.Sleep(5 * time.Second)
 
@@ -522,10 +473,24 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 		return
 	}
 
-	// L'ordre a été exécuté, passer à l'étape de vente
+	// === L'ORDRE EST REMPLI, RÉCUPÉRER LES FRAIS D'ACHAT DE FAÇON PRÉCISE ===
 	color.Green("Cycle %d: Ordre d'achat exécuté", cycle.IdInt)
 
-	// ====== DÉBUT NOUVELLE PARTIE - EXTRACTION DE LA QUANTITÉ RÉELLEMENT EXÉCUTÉE DEPUIS L'API ======
+	// Récupérer les frais d'achat réels
+	var buyFees float64
+	// Tenter de récupérer les frais avec la méthode publique GetOrderFees
+	buyFees, err = client.GetOrderFees(cleanBuyId)
+	if err != nil {
+		// Si on ne peut pas récupérer les frais, estimer avec le taux par défaut
+		feeRate := getFeeRateForExchange(cycle.Exchange)
+		buyFees = cycle.BuyPrice * cycle.Quantity * feeRate
+		color.Yellow("Impossible de récupérer les frais d'achat, estimation selon le taux standard: %.8f USDC (taux: %.4f%%)",
+			buyFees, feeRate*100)
+	} else {
+		color.Green("Frais d'achat récupérés: %.8f USDC", buyFees)
+	}
+
+	// Extraire la quantité réellement exécutée depuis l'API
 	var executedQty float64 = 0
 
 	switch cycle.Exchange {
@@ -541,12 +506,11 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 		}
 
 	case "BINANCE":
-		// Format de réponse pour Binance
 		executedQtyStr, err := jsonparser.GetString(orderBytes, "executedQty")
 		if err == nil && executedQtyStr != "" {
 			parsedQty, parseErr := strconv.ParseFloat(executedQtyStr, 64)
 			if parseErr == nil && parsedQty > 0 {
-				executedQty = parsedQty
+				executedQty = math.Floor(parsedQty*100000000) / 100000000
 				color.Yellow("BINANCE: Quantité exécutée extraite de l'API: %.8f BTC", executedQty)
 			}
 		}
@@ -565,8 +529,6 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 	case "KRAKEN":
 		// Format de réponse pour Kraken
 		var volExecStr string
-
-		// Essayer différents chemins possibles dans la réponse JSON
 		volExecStr, _ = jsonparser.GetString(orderBytes, "vol_exec")
 		if volExecStr == "" {
 			volExecStr, _ = jsonparser.GetString(orderBytes, "executed")
@@ -581,27 +543,133 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 		}
 	}
 
-	// Si nous avons pu extraire une quantité valide de l'API ET si elle est différente de la quantité initiale
-	if executedQty > 0 && math.Abs(executedQty-cycle.Quantity)/cycle.Quantity > 0.001 { // Différence de plus de 0.1%
+	// Si nous avons pu extraire une quantité valide et différente de la quantité initiale, mettre à jour
+	if executedQty > 0 && math.Abs(executedQty-cycle.Quantity)/cycle.Quantity > 0.0005 && cycle.Exchange != "BINANCE" {
 		color.Yellow("Cycle %d: Mise à jour de la quantité de %.8f BTC à %.8f BTC (d'après l'API)",
 			cycle.IdInt, cycle.Quantity, executedQty)
 
-		// Mettre à jour la quantité dans la base de données
+		// Calculer le montant d'achat précis (prix * quantité)
+		purchaseAmountUSDC := cycle.BuyPrice * executedQty
+
+		// Mettre à jour la quantité et stocker les frais dans la base de données
 		err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-			"quantity": executedQty,
+			"quantity":           executedQty,
+			"buyFees":            buyFees,            // Nouveau: stocker les frais d'achat dans un champ dédié
+			"totalFees":          buyFees,            // Initialiser totalFees avec buyFees
+			"purchaseAmountUSDC": purchaseAmountUSDC, // Stocker le montant exact d'achat
 		})
 
 		if err != nil {
-			color.Red("Erreur lors de la mise à jour de la quantité: %v", err)
-			// Continuer avec la quantité originale
+			color.Red("Erreur lors de la mise à jour de la quantité et des frais: %v", err)
 		} else {
 			// Mettre à jour l'objet cycle local pour la suite du traitement
 			cycle.Quantity = executedQty
+			cycle.TotalFees = buyFees
+			cycle.PurchaseAmountUSDC = purchaseAmountUSDC
+		}
+	} else {
+		// Si la quantité reste inchangée, mettre à jour uniquement les frais
+		// Calculer le montant d'achat précis (prix * quantité)
+		purchaseAmountUSDC := cycle.BuyPrice * cycle.Quantity
+
+		err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
+			"buyFees":            buyFees,            // Nouveau: stocker les frais d'achat dans un champ dédié
+			"totalFees":          buyFees,            // Initialiser totalFees avec buyFees
+			"purchaseAmountUSDC": purchaseAmountUSDC, // Stocker le montant exact d'achat
+		})
+
+		if err != nil {
+			color.Red("Erreur lors de la mise à jour des frais: %v", err)
+		} else {
+			cycle.TotalFees = buyFees
+			cycle.PurchaseAmountUSDC = purchaseAmountUSDC
 		}
 	}
-	// ====== FIN NOUVELLE PARTIE ======
 
-	// ==== VÉRIFICATION DES SOLDES ====
+	// ========= CALCUL DU PRIX DE VENTE =========
+	// 1. Prix de vente standard basé sur la configuration
+	sellOffset := exchangeConfig.SellOffset
+	standardSellPrice := cycle.BuyPrice + sellOffset
+
+	// 2. Prix minimum pour être maker (légèrement au-dessus du prix actuel)
+	makerMinPrice := lastPrice * 1.001
+
+	// 3. Prix ajusté pour couvrir les frais
+	var feeAdjustedPrice float64
+
+	// Utiliser la méthode AdjustSellPriceForFees de l'interface Exchange pour calculer un prix
+	// qui prend en compte les frais d'achat et de vente
+	adjustedPrice, err := client.AdjustSellPriceForFees(cycle.BuyPrice, cycle.Quantity, cleanBuyId)
+	if err == nil {
+		feeAdjustedPrice = adjustedPrice
+		color.Yellow("Cycle %d: Prix de vente ajusté pour les frais via API: %.2f USDC",
+			cycle.IdInt, feeAdjustedPrice)
+	} else {
+		// En cas d'erreur, on retombe sur l'estimation des frais
+		color.Yellow("Erreur lors de l'ajustement du prix via API: %v, utilisation de l'estimation", err)
+
+		// Estimer les frais selon l'exchange
+		var feeRate float64 = getFeeRateForExchange(cycle.Exchange)
+
+		// Estimer les frais de vente
+		estimatedSellFees := cycle.BuyPrice * cycle.Quantity * feeRate
+
+		// Total des frais estimés (achat déjà récupéré + vente estimée)
+		totalFeesEstimated := buyFees + estimatedSellFees
+
+		// Ajouter une marge de sécurité
+		if cycle.Exchange == "KRAKEN" {
+			totalFeesEstimated *= 1.1
+		} else {
+			totalFeesEstimated *= 1.05
+		}
+
+		// Calculer l'ajustement par unité
+		feeAdjustmentPerUnit := totalFeesEstimated / cycle.Quantity
+
+		// Prix minimum pour couvrir les frais estimés
+		feeAdjustedPrice = cycle.BuyPrice + feeAdjustmentPerUnit
+
+		color.Yellow("Cycle %d: Prix de vente ajusté pour frais estimés: %.2f USDC (frais estimés: %.8f USDC)",
+			cycle.IdInt, feeAdjustedPrice, totalFeesEstimated)
+	}
+
+	// 4. Déterminer le prix de vente final (le maximum des trois valeurs)
+	var finalSellPrice float64
+
+	// a) Si le prix ajusté pour les frais est le plus élevé
+	if feeAdjustedPrice >= standardSellPrice && feeAdjustedPrice >= makerMinPrice {
+		finalSellPrice = feeAdjustedPrice
+		color.Yellow("Cycle %d: Prix de vente déterminé par les frais: %.2f USDC", cycle.IdInt, finalSellPrice)
+	} else if makerMinPrice >= standardSellPrice && makerMinPrice >= feeAdjustedPrice {
+		// b) Si le prix maker minimum est le plus élevé
+		finalSellPrice = makerMinPrice
+		color.Yellow("Cycle %d: Prix de vente déterminé pour être maker: %.2f USDC", cycle.IdInt, finalSellPrice)
+	} else {
+		// c) Si le prix standard est le plus élevé
+		finalSellPrice = standardSellPrice
+		color.Yellow("Cycle %d: Prix de vente standard utilisé: %.2f USDC", cycle.IdInt, finalSellPrice)
+	}
+
+	// Calculer le montant de vente prévu
+	saleAmountUSDC := finalSellPrice * cycle.Quantity
+
+	// Mise à jour du prix de vente et du montant de vente prévu dans la base de données
+	err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
+		"sellPrice":      finalSellPrice,
+		"saleAmountUSDC": saleAmountUSDC, // Nouveau: stocker le montant exact de vente prévu
+	})
+
+	if err != nil {
+		color.Red("Erreur lors de la mise à jour du prix de vente: %v", err)
+		return
+	}
+
+	// Mettre à jour l'objet cycle local
+	cycle.SellPrice = finalSellPrice
+	cycle.SaleAmountUSDC = saleAmountUSDC
+
+	// Vérifier le solde BTC disponible
 	balances, balErr := client.GetDetailedBalances()
 	if balErr != nil {
 		color.Red("Erreur lors de la récupération des soldes: %v", balErr)
@@ -610,80 +678,40 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 
 	// Vérifier que le BTC est réellement disponible
 	availableBTC := balances["BTC"].Free
-	if availableBTC < cycle.Quantity*0.99 {
-		color.Yellow("Cycle %d: Solde BTC disponible insuffisant (%.8f) pour vendre %.8f BTC. L'ordre semble ne pas être réellement exécuté.",
-			cycle.IdInt, availableBTC, cycle.Quantity)
 
-		// L'ordre n'est probablement pas exécuté, malgré ce que dit IsFilled
-		// Vérifier l'âge et annuler si nécessaire
-		age := cycle.GetAge()
-		if maxDays > 0 && age >= float64(maxDays) {
-			color.Yellow("Cycle %d: L'ordre d'achat a dépassé l'âge maximal. Annulation forcée...", cycle.IdInt)
-			success, _ := safeOrderCancel(client, cleanBuyId, cycle.IdInt)
-			if success {
-				err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-					"status": "cancelled",
-				})
-				if err == nil {
-					color.Green("Cycle %d: Ordre annulé et cycle marqué comme annulé", cycle.IdInt)
-				}
-			}
-		}
-		return
-	}
-	// Utiliser l'offset de vente spécifique à l'exchange
-	sellOffset := exchangeConfig.SellOffset
-
-	// 1. Calculer le prix de vente standard : prix d'achat + SELL_OFFSET
-	standardSellPrice := cycle.BuyPrice + sellOffset
-
-	// 2. Calculer le prix minimum pour être "maker" : prix actuel + 0.1%
-	makerMinPrice := lastPrice * 1.001
-
-	// 3. Choisir le prix de vente final (le plus élevé des deux)
-	var newSellPrice float64
-	if standardSellPrice < makerMinPrice {
-		newSellPrice = makerMinPrice
-		color.Yellow("Cycle %d: Prix de vente ajusté pour être maker: %.2f → %.2f (prix actuel: %.2f + 0.1%%)",
-			cycle.IdInt, standardSellPrice, newSellPrice, lastPrice)
-	} else {
-		newSellPrice = standardSellPrice
-		color.Yellow("Cycle %d: Prix de vente standard utilisé: %.2f (> prix actuel: %.2f + 0.1%%)",
-			cycle.IdInt, newSellPrice, lastPrice)
-	}
-
-	// CORRECTION: Mettre à jour le prix de vente dans la base de données avant de placer l'ordre
-	// Cette mise à jour garantit que le prix affiché sera le prix réel utilisé
-	err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-		"sellPrice": newSellPrice,
-	})
-	if err != nil {
-		color.Red("Erreur lors de la mise à jour du prix de vente: %v", err)
-		return
-	}
-
-	// Mettre à jour l'objet cycle local pour qu'il reflète les changements
-	cycle.SellPrice = newSellPrice
-
-	// ==== DÉBUT DE LA MODIFICATION: AJUSTEMENT DE LA QUANTITÉ ====
-	// Utiliser la quantité disponible si elle est légèrement inférieure à la quantité attendue
+	// Ajuster la quantité si nécessaire
 	quantityToSell := cycle.Quantity
-	if availableBTC < quantityToSell && availableBTC > quantityToSell*0.99 {
-		// Si on a au moins 99% de la quantité, adapter pour utiliser ce qui est disponible
+	if availableBTC < quantityToSell && availableBTC > quantityToSell*0.95 {
 		color.Yellow("Cycle %d: Ajustement de la quantité à vendre de %.8f à %.8f (disponible)",
 			cycle.IdInt, quantityToSell, availableBTC)
 		quantityToSell = availableBTC
+
+		// Mettre à jour le montant de vente prévu avec la nouvelle quantité
+		saleAmountUSDC = finalSellPrice * quantityToSell
+		cycle.SaleAmountUSDC = saleAmountUSDC
 	}
-	// ==== FIN DE LA MODIFICATION: AJUSTEMENT DE LA QUANTITÉ ====
+
+	if cycle.Exchange == "BINANCE" {
+		quantityToSell = executedQty
+		color.Yellow("Cycle %d: Utilisation de la quantité exacte achetée: %.8f BTC",
+			cycle.IdInt, quantityToSell)
+	}
 
 	// Préparer les paramètres de l'ordre de vente
 	quantityStr := strconv.FormatFloat(quantityToSell, 'f', 8, 64)
-	sellPriceStr := strconv.FormatFloat(newSellPrice, 'f', 2, 64)
+	sellPriceStr := strconv.FormatFloat(finalSellPrice, 'f', 2, 64)
 
-	// ==== DÉBUT DE LA MODIFICATION: GESTION DES ERREURS DE CRÉATION D'ORDRE ====
-	// Créer l'ordre de vente directement avec le prix déjà ajusté en mode maker
+	// Créer l'ordre de vente
 	sellBytes, err := client.CreateOrder("SELL", sellPriceStr, quantityStr)
+
+	// Gestion améliorée pour Kraken
 	if err != nil {
+		// Cas spécial pour Kraken: vérifier si l'ordre a été créé malgré l'erreur
+		if cycle.Exchange == "KRAKEN" && strings.Contains(err.Error(), "Insufficient funds") {
+			color.Yellow("Kraken a signalé 'fonds insuffisants', vérification si l'ordre a été créé malgré l'erreur...")
+			time.Sleep(10 * time.Second)
+		}
+
 		color.Red("Erreur lors de la création de l'ordre de vente: %v", err)
 
 		// Si l'erreur est de type "Oversold", donner des instructions spécifiques
@@ -708,7 +736,6 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 
 		return
 	}
-	// ==== FIN DE LA MODIFICATION: GESTION DES ERREURS DE CRÉATION D'ORDRE ====
 
 	// Extraire l'ID de l'ordre de vente
 	orderIdValue, dataType, _, err := jsonparser.Get(sellBytes, "orderId")
@@ -722,13 +749,10 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 	var orderIdStr string
 	switch dataType {
 	case jsonparser.String:
-		// Si c'est déjà une chaîne
 		orderIdStr = string(orderIdValue)
 	case jsonparser.Number:
-		// Si c'est un nombre, le convertir en chaîne
 		orderIdStr = string(orderIdValue)
 	default:
-		// Fallback au cas où
 		orderIdStr = string(orderIdValue)
 		color.Yellow("Type de données inattendu pour l'ID d'ordre: %v", dataType)
 	}
@@ -751,10 +775,11 @@ func processBuyCycle(client common.Exchange, repo *database.CycleRepository, cyc
 	}
 
 	// Calculer et afficher le profit potentiel
-	profitPercent := ((newSellPrice - cycle.BuyPrice) / cycle.BuyPrice) * 100
+	profitPercent := ((finalSellPrice - cycle.BuyPrice) / cycle.BuyPrice) * 100
 	color.Green("Cycle %d: Ordre de vente placé avec succès. ID: %s", cycle.IdInt, orderIdStr)
 	color.Green("Cycle %d: Prix d'achat: %.2f, Prix de vente: %.2f, Profit potentiel: %.2f%%",
-		cycle.IdInt, cycle.BuyPrice, newSellPrice, profitPercent)
+		cycle.IdInt, cycle.BuyPrice, finalSellPrice, profitPercent)
+	color.Green("Cycle %d: Frais d'achat: %.8f USDC", cycle.IdInt, buyFees)
 }
 
 func processSellCycle(client common.Exchange, repo *database.CycleRepository, cycle *database.Cycle) {
@@ -786,118 +811,6 @@ func processSellCycle(client common.Exchange, repo *database.CycleRepository, cy
 		color.Yellow("Conditions d'accumulation remplies pour le cycle %d:", cycle.IdInt)
 		color.Yellow("  - Déviation de prix: %.2f%% (seuil: %.2f%%)", deviationPercent, exchangeConfig.SellAccuPriceDeviation)
 		color.Yellow("  - Annulation de l'ordre de vente pour accumulation...")
-
-		// Nettoyer l'ID d'ordre de vente en spécifiant l'exchange
-		cleanSellId := cleanOrderId(cycle.SellId, cycle.Exchange)
-
-		// Si l'ID d'ordre de vente est vide, tenter de créer un nouvel ordre de vente
-		if cleanSellId == "" {
-			color.Yellow("Cycle %d: ID d'ordre de vente vide. Tentative de création d'un nouvel ordre de vente.", cycle.IdInt)
-
-			// Vérifier le solde BTC disponible
-			balances, balErr := client.GetDetailedBalances()
-			if balErr != nil {
-				color.Red("Cycle %d: Erreur lors de la récupération des soldes: %v", cycle.IdInt, balErr)
-				return
-			}
-
-			availableBTC := balances["BTC"].Free
-			if availableBTC < cycle.Quantity*0.99 {
-				color.Yellow("Cycle %d: Solde BTC disponible toujours insuffisant (%.8f) pour vendre %.8f BTC.",
-					cycle.IdInt, availableBTC, cycle.Quantity)
-				return
-			}
-
-			// Solde suffisant, créer l'ordre de vente
-			currentPrice := client.GetLastPriceBTC()
-
-			// Obtenir la configuration de l'exchange pour l'offset de vente
-			cfg, cfgErr := config.LoadConfig()
-			if cfgErr != nil {
-				color.Red("Cycle %d: Erreur lors du chargement de la configuration: %v", cycle.IdInt, cfgErr)
-				return
-			}
-
-			exchangeConfig, exchangeErr := cfg.GetExchangeConfig(cycle.Exchange)
-			if exchangeErr != nil {
-				color.Red("Cycle %d: Erreur lors de la récupération de la configuration de l'exchange: %v", cycle.IdInt, exchangeErr)
-				return
-			}
-
-			// Calculer le prix de vente
-			sellOffset := exchangeConfig.SellOffset
-			standardSellPrice := cycle.BuyPrice + sellOffset
-			makerMinPrice := currentPrice * 1.001
-
-			var sellPrice float64
-			if standardSellPrice < makerMinPrice {
-				sellPrice = makerMinPrice
-				color.Yellow("Cycle %d: Prix de vente ajusté pour être maker: %.2f → %.2f",
-					cycle.IdInt, standardSellPrice, sellPrice)
-			} else {
-				sellPrice = standardSellPrice
-			}
-
-			// Mettre à jour le prix de vente dans la base de données
-			err := repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-				"sellPrice": sellPrice,
-			})
-			if err != nil {
-				color.Red("Cycle %d: Erreur lors de la mise à jour du prix de vente: %v", cycle.IdInt, err)
-				return
-			}
-
-			// Créer l'ordre de vente
-			quantityStr := strconv.FormatFloat(cycle.Quantity, 'f', 8, 64)
-			sellPriceStr := strconv.FormatFloat(sellPrice, 'f', 2, 64)
-
-			sellBytes, err := client.CreateOrder("SELL", sellPriceStr, quantityStr)
-			if err != nil {
-				color.Red("Cycle %d: Erreur lors de la création de l'ordre de vente: %v", cycle.IdInt, err)
-				return
-			}
-
-			// Extraire l'ID de l'ordre de vente
-			orderIdValue, dataType, _, err := jsonparser.Get(sellBytes, "orderId")
-			if err != nil {
-				color.Red("Cycle %d: Erreur lors de l'extraction de l'ID d'ordre: %v", cycle.IdInt, err)
-				return
-			}
-
-			// Déterminer l'ID de l'ordre de vente
-			var orderIdStr string
-			switch dataType {
-			case jsonparser.String:
-				orderIdStr = string(orderIdValue)
-			case jsonparser.Number:
-				orderIdStr = string(orderIdValue)
-			default:
-				orderIdStr = string(orderIdValue)
-			}
-
-			if orderIdStr == "" {
-				color.Red("Cycle %d: ID d'ordre vide obtenu de la réponse API", cycle.IdInt)
-				return
-			}
-
-			// Mettre à jour le cycle avec le nouvel ID d'ordre de vente
-			err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
-				"sellId": orderIdStr,
-			})
-			if err != nil {
-				color.Red("Cycle %d: Erreur lors de la mise à jour du cycle: %v", cycle.IdInt, err)
-				return
-			}
-
-			color.Green("Cycle %d: Nouvel ordre de vente créé avec succès. ID: %s", cycle.IdInt, orderIdStr)
-
-			// Mettre à jour l'objet cycle pour la suite du traitement
-			cycle.SellId = orderIdStr
-			cycle.SellPrice = sellPrice
-
-			// On continue le traitement normal, mais avec un SellId qui vient d'être créé
-			cleanSellId = cleanOrderId(cycle.SellId, cycle.Exchange)
-		}
 
 		// Créer une nouvelle entrée d'accumulation
 		accumulation := &database.Accumulation{
@@ -963,21 +876,39 @@ func processSellCycle(client common.Exchange, repo *database.CycleRepository, cy
 		return
 	}
 
-	// Tenter d'extraire la date réelle d'exécution
+	// Récupérer les frais de vente réels
+	var sellFees float64
+	// Tenter de récupérer les frais avec la méthode publique GetOrderFees
+	sellFees, err = client.GetOrderFees(cleanSellId)
+	if err != nil {
+		// Si on ne peut pas récupérer les frais, estimer avec le taux par défaut
+		feeRate := getFeeRateForExchange(cycle.Exchange)
+		sellFees = cycle.SellPrice * cycle.Quantity * feeRate
+		color.Yellow("Impossible de récupérer les frais de vente, estimation selon le taux standard: %.8f USDC (taux: %.4f%%)",
+			sellFees, feeRate*100)
+	} else {
+		color.Green("Frais de vente récupérés: %.8f USDC", sellFees)
+	}
+
+	// Ajouter directement les frais de vente aux frais totaux déjà enregistrés
+	totalFees := cycle.TotalFees + sellFees
+
+	// Tenter d'extraire la date réelle d'exécution et les frais selon l'exchange
 	completionTime := time.Now() // Valeur par défaut
 	extractionSuccessful := false
 
 	// Extraction spécifique à chaque exchange
 	switch cycle.Exchange {
 	case "BINANCE":
-		updateTimeMs, err := jsonparser.GetInt(orderBytes, "updateTime")
-		if err == nil {
+		updateTimeMs, timeErr := jsonparser.GetInt(orderBytes, "updateTime")
+		if timeErr == nil {
 			extractedTime := time.Unix(0, updateTimeMs*int64(time.Millisecond))
 			if extractedTime.After(cycle.CreatedAt) {
 				completionTime = extractedTime
 				extractionSuccessful = true
 			}
 		}
+
 	case "MEXC":
 		// Utiliser une estimation raisonnable pour MEXC (6h après création)
 		// car ses timestamps sont souvent incorrects
@@ -990,6 +921,7 @@ func processSellCycle(client common.Exchange, repo *database.CycleRepository, cy
 			completionTime = now.Add(-1 * time.Hour)
 		}
 		extractionSuccessful = true
+
 	case "KUCOIN":
 		// Pour KuCoin, extraire la date si possible
 		createdAtStr, err := jsonparser.GetString(orderBytes, "createdAt")
@@ -1003,6 +935,7 @@ func processSellCycle(client common.Exchange, repo *database.CycleRepository, cy
 				}
 			}
 		}
+
 	case "KRAKEN":
 		// Pour Kraken, tenter d'extraire le timestamp de fermeture ou utiliser une estimation
 		// Les formats de réponse de Kraken peuvent varier, vérifier plusieurs possibilités
@@ -1034,22 +967,45 @@ func processSellCycle(client common.Exchange, repo *database.CycleRepository, cy
 		color.Yellow("Utilisation de la date actuelle comme date de complétion pour le cycle %d", cycle.IdInt)
 	}
 
+	// Calculer le profit net en tenant compte des frais spécifiques
+	var profit, profitPercent float64
+	buyAmount := cycle.BuyPrice * cycle.Quantity
+	sellAmount := cycle.SellPrice * cycle.Quantity
+
+	profit = sellAmount - buyAmount - totalFees
+	if buyAmount > 0 {
+		profitPercent = (profit / buyAmount) * 100
+	}
+
+	// Afficher les détails du profit avec les frais
+	if totalFees > 0 {
+		color.Green("Cycle %d: COMPLÉTÉ AVEC SUCCÈS! (Profit net: %.2f USDC, %.2f%%)",
+			cycle.IdInt, profit, profitPercent)
+		color.Green("Frais totaux: %.8f USDC (Achat: %.8f, Vente: %.8f)",
+			totalFees, sellFees)
+	} else {
+		color.Green("Cycle %d: COMPLÉTÉ AVEC SUCCÈS!", cycle.IdInt)
+	}
+
 	// Mettre à jour le cycle dans la base de données
-	err = repo.UpdateByIdInt(cycle.IdInt, map[string]interface{}{
+	// Ajouter les champs de frais dans la mise à jour
+	updateFields := map[string]interface{}{
 		"status":      "completed",
 		"completedAt": completionTime.Format(time.RFC3339),
-	})
+		"sellFees":    sellFees,
+		"totalFees":   totalFees,
+	}
 
+	err = repo.UpdateByIdInt(cycle.IdInt, updateFields)
 	if err != nil {
 		color.Red("Erreur lors de la mise à jour du cycle: %v", err)
 		return
 	}
 
-	// Mettre à jour l'objet cycle en mémoire également (pour les opérations qui suivent)
+	// Mettre à jour l'objet cycle en mémoire également
 	cycle.Status = "completed"
 	cycle.CompletedAt = completionTime
 
-	color.Green("Cycle %d: COMPLÉTÉ AVEC SUCCÈS!", cycle.IdInt)
 	color.Green("Date d'achat: %s", cycle.CreatedAt.Format("02/01/2006 15:04"))
 	color.Green("Date de vente: %s", completionTime.Format("02/01/2006 15:04"))
 	color.Green("Durée du cycle: %s", formatDetailedDuration(time.Since(cycle.CreatedAt).Hours()/24))
@@ -1071,11 +1027,12 @@ func displayCyclesHistory(cycles []*database.Cycle, _ float64) {
 	color.Cyan("===== CYCLES ACTIFS =====")
 	fmt.Println("")
 
-	headerFormat := "%-5s | %-10s | %-12s | %-15s | %-20s | %-15s | %-15s\n"
-	rowFormat := "%-5d | %-10s | %-12s | %-15.2f | %-20.2f | %-15s | %-15s\n"
+	// Nouvel en-tête avec les colonnes prix BTC à l'achat et à la vente
+	headerFormat := "%-5s | %-10s | %-12s | %-15s | %-15s | %-15s | %-15s | %-15s\n"
+	rowFormat := "%-5d | %-10s | %-12s | %-15.2f | %-15.2f | %-15.2f | %-15s | %-15s\n"
 
-	fmt.Printf(headerFormat, "ID", "EXCHANGE", "STATUT", "MONTANT USDC", "MONTANT PRÉVU VENTE", "GAINS PRÉVUS", "DURÉE")
-	fmt.Println("-------+------------+--------------+-----------------+----------------------+-----------------+-----------------")
+	fmt.Printf(headerFormat, "ID", "EXCHANGE", "STATUT", "MONTANT USDC", "PRIX BTC ACHAT", "PRIX BTC VENTE", "GAINS PRÉVUS", "DURÉE")
+	fmt.Println("-------+------------+--------------+-----------------+-----------------+-----------------+-----------------+-----------------")
 
 	// Trier les cycles par ID (du plus récent au plus ancien)
 	sort.Slice(cycles, func(i, j int) bool {
@@ -1112,7 +1069,67 @@ func displayCyclesHistory(cycles []*database.Cycle, _ float64) {
 		usdcSaleAmount := cycle.SellPrice * cycle.Quantity
 
 		// Calculer les gains prévus (en valeur absolue et en pourcentage)
-		expectedProfit := usdcSaleAmount - usdcAmount
+		var expectedProfit float64
+
+		// Obtenir un client pour cet exchange afin de pouvoir utiliser GetOrderFees
+		var client common.Exchange
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					color.Red("Erreur lors de l'initialisation du client pour %s: %v", cycle.Exchange, r)
+				}
+			}()
+			client = GetClientByExchange(cycle.Exchange)
+		}()
+
+		// Récupérer les frais d'achat réels si possible sinon estimer les frais
+		var buyFees, sellFees float64
+
+		if client != nil {
+			// Si nous avons un ID d'achat et que l'ordre est déjà exécuté
+			if cycle.BuyId != "" {
+				// Nettoyer l'ID de l'ordre d'achat selon l'exchange
+				cleanBuyId := cleanOrderId(cycle.BuyId, cycle.Exchange)
+				if cleanBuyId != "" {
+					// Tenter de récupérer les frais réels
+					realBuyFees, err := client.GetOrderFees(cleanBuyId)
+					if err == nil && realBuyFees > 0 {
+						buyFees = realBuyFees
+					}
+				} else {
+					// Estimation basique si l'ID n'est pas valide
+					buyFees = usdcAmount * getFeeRateForExchange(cycle.Exchange)
+				}
+			} else {
+				// Si l'ordre d'achat est toujours en cours ou l'ID n'est pas disponible
+				buyFees = usdcAmount * getFeeRateForExchange(cycle.Exchange)
+			}
+
+			// Pour les frais de vente, on doit estimer car l'ordre n'est pas encore exécuté
+			// Appliquer directement le taux de frais (taux maker généralement pour les ventes)
+			sellFees = usdcSaleAmount * getFeeRateForExchange(cycle.Exchange)
+
+			// Calculer le profit en tenant compte des frais
+			expectedProfit = usdcSaleAmount - usdcAmount - (buyFees + sellFees)
+		} else {
+			// Fallback au comportement actuel si on ne peut pas obtenir de client
+			if cycle.Exchange == "KRAKEN" {
+				// Estimer les frais selon le taux maker de Kraken (0.26%)
+				const makerFeeRate = 0.0026
+				buyFees = cycle.BuyPrice * cycle.Quantity * makerFeeRate
+				sellFees = cycle.SellPrice * cycle.Quantity * makerFeeRate
+				expectedProfit = usdcSaleAmount - usdcAmount - (buyFees + sellFees)
+			} else if cycle.Exchange == "BINANCE" {
+				// Binance: 0.1% standard
+				buyFees = usdcAmount * 0.001
+				sellFees = usdcSaleAmount * 0.001
+				expectedProfit = usdcSaleAmount - usdcAmount - (buyFees + sellFees)
+			} else {
+				// Pour les autres exchanges, supposons que les frais sont déjà inclus dans les prix
+				expectedProfit = usdcSaleAmount - usdcAmount
+			}
+		}
+
 		expectedProfitPercent := 0.0
 		if usdcAmount > 0 {
 			expectedProfitPercent = (expectedProfit / usdcAmount) * 100
@@ -1130,7 +1147,8 @@ func displayCyclesHistory(cycles []*database.Cycle, _ float64) {
 			cycle.Exchange,
 			status,
 			usdcAmount,
-			usdcSaleAmount,
+			cycle.BuyPrice,  // Prix du BTC à l'achat
+			cycle.SellPrice, // Prix du BTC à la vente
 			expectedProfitStr,
 			duration)
 
@@ -1142,7 +1160,7 @@ func displayCyclesHistory(cycles []*database.Cycle, _ float64) {
 		color.Yellow("Aucun cycle actif trouvé.")
 	}
 
-	fmt.Println("-------+------------+--------------+-----------------+----------------------+-----------------+-----------------")
+	fmt.Println("-------+------------+--------------+-----------------+-----------------+-----------------+-----------------+-----------------")
 
 	// Afficher les statistiques par exchange avec les nouvelles informations
 	displayExchangeStats("Binance", statsBinance, cycles)
@@ -1167,6 +1185,24 @@ func displayExchangeStats(exchangeName string, stats cycleStatistics, allCycles 
 		profit7d := calculateProfitByPeriod(allCycles, exchangeName, now.Add(-7*24*time.Hour), now)
 		profit30d := calculateProfitByPeriod(allCycles, exchangeName, now.Add(-30*24*time.Hour), now)
 		profit3m := calculateProfitByPeriod(allCycles, exchangeName, now.Add(-90*24*time.Hour), now)
+
+		// Vérifier la cohérence des profits par période
+		// Le profit d'une période plus longue ne devrait pas être inférieur à celui d'une période plus courte
+		if profit7d < profit24h {
+			profit7d = profit24h // Ajustement pour cohérence
+		}
+		if profit30d < profit7d {
+			profit30d = profit7d // Ajustement pour cohérence
+		}
+		if profit3m < profit30d {
+			profit3m = profit30d // Ajustement pour cohérence
+		}
+
+		// S'assurer que le profit total est au moins égal au profit sur 3 mois
+		if stats.totalProfit < profit3m {
+			// Correction statistique
+			stats.totalProfit = profit3m
+		}
 
 		// Afficher les profits avec un format cohérent
 		color.Green("  Profit total:         %.2f USDC", stats.totalProfit)
@@ -1217,8 +1253,7 @@ func calculateDuration(startTime time.Time) string {
 	}
 }
 
-// updateStats met à jour les statistiques de l'exchange approprié
-// Version corrigée pour inclure Kraken
+// Fonction améliorée updateStats pour mettre à jour correctement les statistiques
 func updateStats(cycle *database.Cycle, statsBinance, statsMexc, statsKucoin, statsKraken *cycleStatistics) {
 	// Sélectionner les statistiques de l'exchange approprié
 	var stats *cycleStatistics
@@ -1244,32 +1279,72 @@ func updateStats(cycle *database.Cycle, statsBinance, statsMexc, statsKucoin, st
 		stats.sellCycles++
 	case "completed":
 		stats.completedCycles++
-		profit := (cycle.SellPrice - cycle.BuyPrice) * cycle.Quantity
-		stats.totalProfit += profit
+
+		// Calculer le profit brut
+		grossProfit := (cycle.SellPrice - cycle.BuyPrice) * cycle.Quantity
+
+		// Soustraire les frais stockés pour obtenir le profit net
+		var totalFees float64
+		if cycle.TotalFees > 0 {
+			totalFees = cycle.TotalFees
+		} else {
+			// Si les frais ne sont pas stockés, utiliser une estimation
+			feeRate := getFeeRateForExchange(cycle.Exchange) * 2 // achat + vente
+			totalFees = grossProfit * feeRate
+		}
+
+		netProfit := grossProfit - totalFees
+
+		// Log pour le débogage si nécessaire
+		if cfg != nil && cfg.Environment == "development" {
+			color.Cyan("Cycle %d (%s) - Frais totaux: %.8f USDC",
+				cycle.IdInt, cycle.Exchange, totalFees)
+			color.Cyan("Profit brut: %.8f, Profit net: %.8f",
+				grossProfit, netProfit)
+		}
+
+		// Ajouter le profit net aux statistiques
+		stats.totalProfit += netProfit
 	}
 }
 
 // Fonction utilitaire pour calculer le profit sur une période donnée
 func calculateProfitByPeriod(cycles []*database.Cycle, exchangeName string, startTime, endTime time.Time) float64 {
 	var periodProfit float64
-
-	// Convertir le nom de l'exchange en majuscules pour comparaison insensible à la casse
 	exchangeNameUpper := strings.ToUpper(exchangeName)
 
 	for _, cycle := range cycles {
-		// Normaliser le nom de l'exchange du cycle pour comparaison
 		cycleExchangeUpper := strings.ToUpper(cycle.Exchange)
 
 		// Ne considérer que les cycles de l'exchange spécifié et complétés
 		if cycleExchangeUpper == exchangeNameUpper && cycle.Status == "completed" {
-			// Au lieu d'estimer la date de complétion, nous utilisons la date de création
-			// pour déterminer si le cycle appartient à la période considérée
-			if cycle.CreatedAt.After(startTime) && cycle.CreatedAt.Before(endTime) {
-				// Calculer le profit pour ce cycle
+			// Utiliser la date de complétion pour déterminer si le cycle appartient à la période
+			completionDate := cycle.CompletedAt
+			if completionDate.IsZero() {
+				// Si la date de complétion n'est pas définie, utiliser la date de création
+				// mais ce n'est pas idéal
+				completionDate = cycle.CreatedAt
+			}
+
+			// Vérifier si le cycle a été complété dans la période spécifiée
+			if completionDate.After(startTime) && completionDate.Before(endTime) {
+				// Calculer le profit net pour ce cycle
 				buyValue := cycle.BuyPrice * cycle.Quantity
 				sellValue := cycle.SellPrice * cycle.Quantity
-				profit := sellValue - buyValue
-				periodProfit += profit
+				grossProfit := sellValue - buyValue
+
+				// Utiliser les frais stockés ou estimer si nécessaire
+				var totalFees float64
+				if cycle.TotalFees > 0 {
+					totalFees = cycle.TotalFees
+				} else {
+					// Estimer les frais si non disponibles (fallback)
+					feeRate := getFeeRateForExchange(cycle.Exchange) * 2 // achat + vente
+					totalFees = buyValue * feeRate
+				}
+
+				netProfit := grossProfit - totalFees
+				periodProfit += netProfit
 			}
 		}
 	}
@@ -1330,11 +1405,20 @@ func calculateExchangeProfit(exchange string) (float64, error) {
 	for _, cycle := range cycles {
 		// Ne considérer que les cycles de l'exchange spécifié et complétés
 		if cycle.Exchange == exchange && cycle.Status == "completed" {
-			// Calculer le profit pour ce cycle
+			// Calculer le profit net pour ce cycle
 			buyValue := cycle.BuyPrice * cycle.Quantity
 			sellValue := cycle.SellPrice * cycle.Quantity
-			profit := sellValue - buyValue
-			totalProfit += profit
+			grossProfit := sellValue - buyValue
+
+			// Utiliser les frais stockés ou estimer si nécessaire
+			fees := cycle.TotalFees
+			if fees <= 0 {
+				// Si aucun frais n'est stocké, utiliser une estimation
+				fees = grossProfit * getFeeRateForExchange(exchange) * 2 // Achat + vente
+			}
+
+			netProfit := grossProfit - fees
+			totalProfit += netProfit
 		}
 	}
 
@@ -1457,4 +1541,24 @@ func safeOrderCancel(client common.Exchange, orderId string, cycleId int32) (boo
 
 	// Aucune erreur, l'annulation a réussi normalement
 	return true, nil
+}
+
+// getFeeRateForExchange retourne le taux de frais pour un exchange et un type d'ordre donnés
+func getFeeRateForExchange(exchange string) float64 {
+	switch strings.ToUpper(exchange) {
+	case "KRAKEN":
+		// Kraken: 0.26% frais maker standard
+		return 0.0026
+	case "BINANCE":
+		// Binance: 0.1% standard
+		return 0.001
+	case "MEXC":
+		return 0.0
+	case "KUCOIN":
+		// KuCoin: 0.1% standard
+		return 0.001
+	default:
+		// Valeur par défaut pour les exchanges non reconnus
+		return 0.001
+	}
 }

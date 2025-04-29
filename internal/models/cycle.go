@@ -40,6 +40,7 @@ type Cycle struct {
 	PurchaseAmountUSDC float64 `json:"purchaseAmountUSDC"`
 	SaleAmountUSDC     float64 `json:"saleAmountUSDC"`
 	ExactExchangeGain  float64 `json:"exactExchangeGain"`
+	TotalFees          float64 `json:"totalFees"` // Total des frais (achat + vente)
 }
 
 // Nouvelle fonction pour calculer le gain exact

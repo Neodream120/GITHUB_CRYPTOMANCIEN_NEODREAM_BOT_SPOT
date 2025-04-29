@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/buger/jsonparser"
 	"github.com/fatih/color"
 )
 
@@ -609,4 +610,110 @@ func (c *Client) FormatPrice(symbol string, price float64) (string, error) {
 
 	// Formater le prix avec la précision correcte
 	return strconv.FormatFloat(roundedPrice, 'f', precision, 64), nil
+}
+
+// GetOrderFees récupère les frais appliqués à un ordre spécifique
+func (c *Client) GetOrderFees(orderId string) (float64, error) {
+	// Normaliser l'ID de l'ordre
+	normalizedId := c.normalizeOrderId(orderId)
+	if normalizedId == "" {
+		return 0, fmt.Errorf("ID d'ordre invalide: %s", orderId)
+	}
+
+	// Pour KuCoin, nous devons récupérer les détails de l'ordre
+	// puis extraire les informations sur les frais
+	endpoint := fmt.Sprintf("/api/v1/orders/%s", normalizedId)
+	data, err := c.sendRequest("GET", endpoint, "")
+	if err != nil {
+		return 0, fmt.Errorf("erreur lors de la récupération des détails de l'ordre: %w", err)
+	}
+
+	// Tenter d'extraire les frais directement
+	feesStr, err := jsonparser.GetString(data, "fee")
+	if err == nil {
+		if fees, err := strconv.ParseFloat(feesStr, 64); err == nil {
+			return fees, nil
+		}
+	}
+
+	// Si les frais directs ne sont pas disponibles, essayer de les calculer
+	// à partir des détails de l'ordre
+	dealSize, err := jsonparser.GetString(data, "dealSize")
+	dealPrice, err2 := jsonparser.GetString(data, "dealPrice")
+
+	if err == nil && err2 == nil {
+		size, _ := strconv.ParseFloat(dealSize, 64)
+		price, _ := strconv.ParseFloat(dealPrice, 64)
+
+		if size > 0 && price > 0 {
+			// Taux de frais standard de KuCoin (0.1%)
+			const feeRate = 0.001
+			return size * price * feeRate, nil
+		}
+	}
+
+	// Si nous ne pouvons toujours pas obtenir les frais, estimer
+	return c.estimateOrderFees(data)
+}
+
+// estimateOrderFees estime les frais d'un ordre à partir des données brutes de l'ordre
+func (c *Client) estimateOrderFees(orderData []byte) (float64, error) {
+	// Taux de frais standard de KuCoin (0.1%)
+	const feeRate = 0.001
+
+	// Extraire les valeurs nécessaires
+	var dealAmount float64
+
+	dealAmountStr, err := jsonparser.GetString(orderData, "dealValue")
+	if err == nil {
+		dealAmount, _ = strconv.ParseFloat(dealAmountStr, 64)
+	}
+
+	if dealAmount > 0 {
+		return dealAmount * feeRate, nil
+	}
+
+	// En dernier recours, tenter d'obtenir la taille et le prix
+	dealSize, err1 := jsonparser.GetString(orderData, "dealSize")
+	dealPrice, err2 := jsonparser.GetString(orderData, "dealPrice")
+
+	if err1 == nil && err2 == nil {
+		size, _ := strconv.ParseFloat(dealSize, 64)
+		price, _ := strconv.ParseFloat(dealPrice, 64)
+
+		if size > 0 && price > 0 {
+			return size * price * feeRate, nil
+		}
+	}
+
+	return 0, fmt.Errorf("impossible d'estimer les frais d'ordre")
+}
+
+// AdjustSellPriceForFees ajuste le prix de vente pour prendre en compte les frais
+func (c *Client) AdjustSellPriceForFees(buyPrice float64, quantity float64, buyOrderId string) (float64, error) {
+	// Récupérer les frais réels de l'ordre d'achat si possible
+	buyFees, err := c.GetOrderFees(buyOrderId)
+
+	// Si nous n'avons pas pu récupérer les frais, estimer avec le taux standard
+	if err != nil || buyFees <= 0 {
+		const feeRate = 0.001 // 0.1% pour KuCoin
+		buyFees = buyPrice * quantity * feeRate
+	}
+
+	// Calculer les frais de vente estimés (même taux)
+	sellFees := buyPrice * quantity * 0.001
+
+	// Total des frais à couvrir
+	totalFeesToCover := buyFees + sellFees
+
+	// Ajouter une marge de sécurité de 5%
+	totalFeesToCover *= 1.05
+
+	// Calculer l'ajustement de prix par unité
+	feeAdjustmentPerUnit := totalFeesToCover / quantity
+
+	// Prix minimal pour couvrir les frais
+	minProfitablePrice := buyPrice + feeAdjustmentPerUnit
+
+	return minProfitablePrice, nil
 }

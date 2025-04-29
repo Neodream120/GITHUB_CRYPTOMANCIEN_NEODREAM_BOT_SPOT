@@ -666,3 +666,117 @@ func (c *Client) DumpOrderInfo(orderBytes []byte) {
 		color.Blue("===========================")
 	}
 }
+
+// GetOrderFees récupère les frais appliqués à un ordre spécifique
+func (c *Client) GetOrderFees(orderId string) (float64, error) {
+	// MEXC ne fournit pas d'API directe pour obtenir les frais,
+	// nous devons les extraire de l'historique des trades
+
+	// Normaliser l'ID de l'ordre
+	normalizedId := c.normalizeOrderId(orderId)
+	if normalizedId == "" {
+		return 0, fmt.Errorf("ID d'ordre invalide: %s", orderId)
+	}
+
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+	// Récupérer l'historique des trades
+	queryString := fmt.Sprintf("symbol=BTCUSDC&timestamp=%s", timestamp)
+	signature := c.signRequest(queryString)
+	signedQuery := fmt.Sprintf("%s&signature=%s", queryString, signature)
+
+	tradesData, err := c.sendRequest("GET", "/api/v3/myTrades", signedQuery)
+	if err != nil {
+		// Si nous ne pouvons pas obtenir les trades, estimer les frais
+		return c.estimateOrderFees(normalizedId)
+	}
+
+	// Calculer les frais totaux depuis tous les trades liés à cet ordre
+	var totalFees float64
+	var foundTrades bool
+
+	_, _ = jsonparser.ArrayEach(tradesData, func(trade []byte, dataType jsonparser.ValueType, offset int, _ error) {
+		// Vérifier si ce trade appartient à notre ordre
+		tradeOrderId, err := jsonparser.GetString(trade, "orderId")
+		if err != nil || !strings.Contains(tradeOrderId, normalizedId) {
+			return
+		}
+
+		foundTrades = true
+
+		// Extraire les frais
+		feesStr, err := jsonparser.GetString(trade, "commission")
+		if err == nil {
+			if feeValue, err := strconv.ParseFloat(feesStr, 64); err == nil {
+				totalFees += feeValue
+			}
+		}
+	})
+
+	if foundTrades && totalFees > 0 {
+		return totalFees, nil
+	}
+
+	// Si nous n'avons pas pu obtenir les frais réels, faire une estimation
+	return c.estimateOrderFees(normalizedId)
+}
+
+// estimateOrderFees estime les frais d'un ordre à partir des données de l'ordre
+func (c *Client) estimateOrderFees(orderId string) (float64, error) {
+	// Taux de frais standard de MEXC (0.2%)
+	const feeRate = 0.0
+
+	// Récupérer les détails de l'ordre
+	orderDetails, err := c.GetOrderById(orderId)
+	if err != nil {
+		return 0, fmt.Errorf("erreur lors de la récupération des détails de l'ordre: %w", err)
+	}
+
+	// Récupérer le prix et la quantité exécutée
+	var price, quantity float64
+
+	priceStr, err := jsonparser.GetString(orderDetails, "price")
+	if err == nil {
+		price, _ = strconv.ParseFloat(priceStr, 64)
+	}
+
+	executedQtyStr, err := jsonparser.GetString(orderDetails, "executedQty")
+	if err == nil {
+		quantity, _ = strconv.ParseFloat(executedQtyStr, 64)
+	}
+
+	if price > 0 && quantity > 0 {
+		return price * quantity * feeRate, nil
+	}
+
+	return 0, fmt.Errorf("impossible d'estimer les frais d'ordre")
+}
+
+// AdjustSellPriceForFees ajuste le prix de vente pour prendre en compte les frais
+func (c *Client) AdjustSellPriceForFees(buyPrice float64, quantity float64, buyOrderId string) (float64, error) {
+	// Récupérer les frais réels de l'ordre d'achat si possible
+	buyFees, err := c.GetOrderFees(buyOrderId)
+
+	// Si nous n'avons pas pu récupérer les frais, estimer avec le taux standard
+	if err != nil || buyFees <= 0 {
+		const feeRate = 0.002 // 0.2% pour MEXC
+		buyFees = buyPrice * quantity * feeRate
+	}
+
+	// Calculer les frais de vente estimés (même taux)
+	sellFees := buyPrice * quantity * 0.000
+
+	// Total des frais à couvrir
+	totalFeesToCover := buyFees + sellFees
+
+	// Ajouter une marge de sécurité de 5%
+	totalFeesToCover *= 1.05
+
+	// Calculer l'ajustement de prix par unité
+	feeAdjustmentPerUnit := totalFeesToCover / quantity
+
+	// Prix minimal pour couvrir les frais
+	minProfitablePrice := buyPrice + feeAdjustmentPerUnit
+
+	return minProfitablePrice, nil
+}

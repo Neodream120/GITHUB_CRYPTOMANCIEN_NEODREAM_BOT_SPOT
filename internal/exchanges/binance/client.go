@@ -237,11 +237,11 @@ func (c *Client) AdjustQuantity(symbol string, quantity float64) (float64, error
 	}
 
 	// Ajuster la quantité pour qu'elle soit un multiple du stepSize
-	factor := math.Pow10(decimals)
-	adjusted := math.Floor(quantity*factor/rules.StepSize/factor) * rules.StepSize
+	adjustedStr := fmt.Sprintf("%.*f", decimals, math.Floor(quantity/rules.StepSize)*rules.StepSize)
+	adjusted, _ := strconv.ParseFloat(adjustedStr, 64)
 
 	// Formatage avec précision correcte
-	adjustedStr := strconv.FormatFloat(adjusted, 'f', decimals, 64)
+	adjustedStr = strconv.FormatFloat(adjusted, 'f', decimals, 64)
 	result, _ := strconv.ParseFloat(adjustedStr, 64)
 
 	return result, nil
@@ -453,7 +453,7 @@ func (c *Client) getOriginalDetailedBalances() (map[string]DetailedBalance, erro
 	balances := make(map[string]DetailedBalance)
 
 	// Extraire les soldes de la réponse JSON
-	_, err = jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+	_, _ = jsonparser.ArrayEach(body, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
 		asset, _ := jsonparser.GetString(value, "asset")
 		if asset == "USDC" || asset == "BTC" {
 			freeStr, _ := jsonparser.GetString(value, "free")
@@ -495,4 +495,125 @@ func (c *Client) CreateMakerOrder(side string, price float64, quantity string) (
 	adjustedPriceStr := strconv.FormatFloat(adjustedPrice, 'f', 2, 64)
 
 	return c.CreateOrder(side, adjustedPriceStr, quantity)
+}
+
+// GetOrderFees récupère les frais appliqués à un ordre spécifique
+func (c *Client) GetOrderFees(orderId string) (float64, error) {
+	// Nettoyer l'ID de l'ordre
+	cleanOrderId := orderId
+
+	// Récupérer les détails de l'ordre
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	queryString := fmt.Sprintf("symbol=BTCUSDC&orderId=%s&timestamp=%s", cleanOrderId, timestamp)
+	signature := c.signRequest(queryString)
+	signedQuery := fmt.Sprintf("%s&signature=%s", queryString, signature)
+
+	orderDetails, err := c.sendRequest("GET", "/api/v3/order", signedQuery)
+	if err != nil {
+		return 0, fmt.Errorf("erreur lors de la récupération des détails de l'ordre: %w", err)
+	}
+
+	// Vérifier si l'ordre a des informations de frais
+	commission, err := jsonparser.GetFloat(orderDetails, "commission")
+	if err == nil && commission > 0 {
+		return commission, nil
+	}
+
+	// Si les frais directs ne sont pas disponibles, utilisons l'historique des trades
+	// pour cet ordre pour obtenir les frais cumulés
+	queryString = fmt.Sprintf("symbol=BTCUSDC&orderId=%s&timestamp=%s", cleanOrderId, timestamp)
+	signature = c.signRequest(queryString)
+	signedQuery = fmt.Sprintf("%s&signature=%s", queryString, signature)
+
+	tradesData, err := c.sendRequest("GET", "/api/v3/myTrades", signedQuery)
+	if err != nil {
+		// Si nous ne pouvons pas obtenir les trades, estimer les frais
+		return c.estimateOrderFees(orderDetails)
+	}
+
+	// Calculer les frais totaux depuis tous les trades liés à cet ordre
+	var totalFees float64
+	_, _ = jsonparser.ArrayEach(tradesData, func(trade []byte, dataType jsonparser.ValueType, offset int, _ error) {
+		// Vérifier si ce trade appartient à notre ordre
+		tradeOrderId, err := jsonparser.GetString(trade, "orderId")
+		if err != nil || tradeOrderId != cleanOrderId {
+			return
+		}
+
+		// Extraire les frais
+		fees, err := jsonparser.GetFloat(trade, "commission")
+		if err == nil {
+			totalFees += fees
+			return
+		}
+
+		// Si on n'a pas pu extraire directement, essayer la version chaîne
+		feesStr, err := jsonparser.GetString(trade, "commission")
+		if err == nil {
+			if feeValue, err := strconv.ParseFloat(feesStr, 64); err == nil {
+				totalFees += feeValue
+			}
+		}
+	})
+
+	if totalFees > 0 {
+		return totalFees, nil
+	}
+
+	// Si nous n'avons pas pu obtenir les frais réels, faire une estimation
+	return c.estimateOrderFees(orderDetails)
+}
+
+// estimateOrderFees estime les frais d'un ordre à partir des données de l'ordre
+func (c *Client) estimateOrderFees(orderDetails []byte) (float64, error) {
+	// Taux de frais standard de Binance pour les makers (0.1%)
+	const feeRate = 0.001
+
+	// Récupérer le prix et la quantité exécutée
+	var price, quantity float64
+
+	priceStr, err := jsonparser.GetString(orderDetails, "price")
+	if err == nil {
+		price, _ = strconv.ParseFloat(priceStr, 64)
+	}
+
+	executedQtyStr, err := jsonparser.GetString(orderDetails, "executedQty")
+	if err == nil {
+		quantity, _ = strconv.ParseFloat(executedQtyStr, 64)
+	}
+
+	if price > 0 && quantity > 0 {
+		return price * quantity * feeRate, nil
+	}
+
+	return 0, fmt.Errorf("impossible d'estimer les frais d'ordre")
+}
+
+// AdjustSellPriceForFees ajuste le prix de vente pour prendre en compte les frais
+func (c *Client) AdjustSellPriceForFees(buyPrice float64, quantity float64, buyOrderId string) (float64, error) {
+	// Récupérer les frais réels de l'ordre d'achat si possible
+	buyFees, err := c.GetOrderFees(buyOrderId)
+
+	// Si nous n'avons pas pu récupérer les frais, estimer avec le taux standard
+	if err != nil || buyFees <= 0 {
+		const feeRate = 0.001 // 0.1% pour Binance
+		buyFees = buyPrice * quantity * feeRate
+	}
+
+	// Calculer les frais de vente estimés (même taux)
+	sellFees := buyPrice * quantity * 0.001
+
+	// Total des frais à couvrir
+	totalFeesToCover := buyFees + sellFees
+
+	// Ajouter une marge de sécurité de 5%
+	totalFeesToCover *= 1.05
+
+	// Calculer l'ajustement de prix par unité
+	feeAdjustmentPerUnit := totalFeesToCover / quantity
+
+	// Prix minimal pour couvrir les frais
+	minProfitablePrice := buyPrice + feeAdjustmentPerUnit
+
+	return minProfitablePrice, nil
 }
